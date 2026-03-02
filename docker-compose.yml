@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  migrator:
+    build: .
+    container_name: m365-migrator
+    volumes:
+      # Config and user list (edit these before running)
+      - ./config.json:/app/config.json:ro
+      - ./users.csv:/app/users.csv:ro
+      # Persistent: logs and checkpoint (resume on restart)
+      - ./logs:/app/logs
+      - ./resume.json:/app/resume.json
+    environment:
+      - NODE_ENV=production
+      - VERBOSE=false
+    command: node src/migrator.js --workload all
+    restart: "no"
+
+  # Run only email migration
+  migrate-email:
+    build: .
+    container_name: m365-migrator-email
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./users.csv:/app/users.csv:ro
+      - ./logs:/app/logs
+      - ./resume.json:/app/resume.json
+    command: node src/migrator.js --workload email
+    profiles: ["email"]
+
+  # Run only OneDrive migration
+  migrate-onedrive:
+    build: .
+    container_name: m365-migrator-onedrive
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./users.csv:/app/users.csv:ro
+      - ./logs:/app/logs
+      - ./resume.json:/app/resume.json
+    command: node src/migrator.js --workload onedrive
+    profiles: ["onedrive"]
+
+  # Check migration status
+  status:
+    build: .
+    container_name: m365-migrator-status
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./logs:/app/logs
+      - ./resume.json:/app/resume.json
+    command: node src/status.js
+    profiles: ["status"]

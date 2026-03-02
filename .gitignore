@@ -1,0 +1,8 @@
+node_modules/
+logs/
+resume.json
+
+# IMPORTANT: Never commit these files
+config.json
+*.secret
+.env

@@ -1,0 +1,25 @@
+{
+  "name": "m365-migrator",
+  "version": "1.0.0",
+  "description": "Microsoft 365 Tenant-to-Tenant Migration Tool (Email + OneDrive + Calendar)",
+  "main": "src/migrator.js",
+  "scripts": {
+    "start": "node src/migrator.js",
+    "migrate:email": "node src/migrator.js --workload email",
+    "migrate:onedrive": "node src/migrator.js --workload onedrive",
+    "migrate:calendar": "node src/migrator.js --workload calendar",
+    "migrate:all": "node src/migrator.js --workload all",
+    "status": "node src/status.js"
+  },
+  "dependencies": {
+    "@azure/msal-node": "^2.6.0",
+    "axios": "^1.6.0",
+    "axios-retry": "^4.0.0",
+    "chalk": "^4.1.2",
+    "cli-progress": "^3.12.0",
+    "csv-parse": "^5.5.0",
+    "form-data": "^4.0.0",
+    "minimist": "^1.2.8",
+    "p-limit": "^3.1.0"
+  }
+}
