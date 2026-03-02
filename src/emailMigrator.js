@@ -237,7 +237,7 @@ class EmailMigrator {
         }
 
         try {
-          await this._createMessage(tgtEmail, tgtFolderId, msg);
+          await this._createMessage(srcEmail, tgtEmail, tgtFolderId, msg);
           if (msg.internetMessageId) targetIndex.add(msg.internetMessageId);
           checkpoint[msgKey] = 'done';
           stats.migrated++;
@@ -254,7 +254,23 @@ class EmailMigrator {
     return stats;
   }
 
-  async _createMessage(userEmail, folderId, msg) {
+  async _createMessage(srcEmail, tgtEmail, folderId, msg) {
+    // Prefer MIME copy to preserve original transport headers (Date, Message-ID, etc.)
+    try {
+      const mimeContent = await this.src.getRaw(
+        `/users/${srcEmail}/messages/${msg.id}/$value`,
+        { Accept: 'message/rfc822' }
+      );
+
+      return await this.tgt.postRaw(
+        `/users/${tgtEmail}/mailFolders/${folderId}/messages`,
+        mimeContent,
+        { 'Content-Type': 'text/plain' }
+      );
+    } catch (err) {
+      this.logger.warn(`MIME copy failed for "${msg.subject}"; falling back to JSON mode: ${err.message}`);
+    }
+
     const payload = {
       subject: msg.subject || '(sem assunto)',
       body: msg.body || { contentType: 'text', content: '' },
@@ -276,13 +292,13 @@ class EmailMigrator {
     };
 
     const created = await this.tgt.post(
-      `/users/${userEmail}/mailFolders/${folderId}/messages`,
+      `/users/${tgtEmail}/mailFolders/${folderId}/messages`,
       payload
     );
 
     if (!msg.isDraft) {
       await this.tgt.patch(
-        `/users/${userEmail}/messages/${created.id}`,
+        `/users/${tgtEmail}/messages/${created.id}`,
         { isDraft: false }
       );
     }

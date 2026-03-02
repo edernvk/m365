@@ -14,7 +14,7 @@ class GraphClient {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  async request(method, url, data = null, extraHeaders = {}, attempt = 1) {
+  async request(method, url, data = null, extraHeaders = {}, attempt = 1, responseType = 'json') {
     try {
       const headers = await this.auth.getHeaders();
       const fullUrl = url.startsWith('http') ? url : `${GRAPH_BASE}${url}`;
@@ -24,6 +24,7 @@ class GraphClient {
         url: fullUrl,
         headers: { ...headers, ...extraHeaders },
         data: data || undefined,
+        responseType,
         maxContentLength: Infinity,
         maxBodyLength: Infinity,
         validateStatus: null
@@ -33,13 +34,13 @@ class GraphClient {
       if (response.status === 429) {
         const retryAfter = parseInt(response.headers['retry-after'] || '10') * 1000;
         await this._sleep(retryAfter);
-        return this.request(method, url, data, extraHeaders, attempt);
+        return this.request(method, url, data, extraHeaders, attempt, responseType);
       }
 
       // 503 or 504 = retry
       if ((response.status === 503 || response.status === 504) && attempt <= this.retryAttempts) {
         await this._sleep(this.retryDelay * attempt);
-        return this.request(method, url, data, extraHeaders, attempt + 1);
+        return this.request(method, url, data, extraHeaders, attempt + 1, responseType);
       }
 
       if (response.status >= 400) {
@@ -54,7 +55,7 @@ class GraphClient {
       if (err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT') {
         if (attempt <= this.retryAttempts) {
           await this._sleep(this.retryDelay * attempt);
-          return this.request(method, url, data, extraHeaders, attempt + 1);
+          return this.request(method, url, data, extraHeaders, attempt + 1, responseType);
         }
       }
       throw err;
@@ -70,6 +71,14 @@ class GraphClient {
 
   async post(url, data) {
     return this.request('POST', url, data);
+  }
+
+  async getRaw(url, extraHeaders = {}) {
+    return this.request('GET', url, null, extraHeaders, 1, 'text');
+  }
+
+  async postRaw(url, data, extraHeaders = {}) {
+    return this.request('POST', url, data, extraHeaders, 1, 'json');
   }
 
   async put(url, data, extraHeaders = {}) {
