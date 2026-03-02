@@ -265,7 +265,7 @@ class EmailMigrator {
       return await this.tgt.postRaw(
         `/users/${tgtEmail}/mailFolders/${folderId}/messages`,
         mimeContent,
-        { 'Content-Type': 'text/plain' }
+        { 'Content-Type': 'message/rfc822' }
       );
     } catch (err) {
       this.logger.warn(`MIME copy failed for "${msg.subject}"; falling back to JSON mode: ${err.message}`);

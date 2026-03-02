@@ -74,7 +74,7 @@ class GraphClient {
   }
 
   async getRaw(url, extraHeaders = {}) {
-    return this.request('GET', url, null, extraHeaders, 1, 'text');
+    return this.request('GET', url, null, extraHeaders, 1, 'arraybuffer');
   }
 
   async postRaw(url, data, extraHeaders = {}) {
