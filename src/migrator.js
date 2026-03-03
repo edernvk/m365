@@ -85,7 +85,7 @@ async function main() {
   const srcClient = new GraphClient(srcAuth, config.migration);
   const tgtClient = new GraphClient(tgtAuth, config.migration);
 
-  // Checkpoint manager
+  // Checkpoint manager with absolute path
   const checkpointPath = path.resolve(process.cwd(), config.checkpoint_file || 'resume.json');
   const checkpoint = new CheckpointManager(checkpointPath);
   if (RESET) {
@@ -128,7 +128,8 @@ async function main() {
 
         if (wl === 'email') {
           const migrator = new EmailMigrator(srcClient, tgtClient, config.migration, userLogger);
-          result = await migrator.migrate(user.source, user.target, cp);
+          // CRITICAL FIX: Pass checkpoint manager as 4th parameter
+          result = await migrator.migrate(user.source, user.target, cp, checkpoint);
         } else if (wl === 'onedrive') {
           const migrator = new OneDriveMigrator(srcClient, tgtClient, config.migration, userLogger);
           result = await migrator.migrate(user.source, user.target, cp);
