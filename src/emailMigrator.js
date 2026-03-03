@@ -1,7 +1,7 @@
 /**
  * Email Migration Module
  * - Pre-scan: logs total messages and MB before migrating
- * - Deduplication: skips messages already in target (by internetMessageId)
+ * - Deduplication: skips messages already in target (by internetMessageId + conversationId fallback)
  * - Checkpoint: skips already migrated messages on resume
  * - Date preservation: uses singleValueExtendedProperties to set original date
  * - Headers: not preserved (Microsoft Graph API limit causes issues)
@@ -128,13 +128,21 @@ class EmailMigrator {
   }
 
   async _buildTargetIndex(userEmail, folderId) {
-    const ids = new Set();
+    const ids = new Map(); // Mudou de Set para Map para armazenar diferentes tipos de chaves
     try {
       for await (const msg of this.tgt.paginate(
         `/users/${userEmail}/mailFolders/${folderId}/messages`,
-        { '$select': 'internetMessageId', '$top': 500 }
+        { '$select': 'internetMessageId,conversationId,subject,sentDateTime', '$top': 500 }
       )) {
-        if (msg.internetMessageId) ids.add(msg.internetMessageId);
+        // Chave primária: internetMessageId (quando existe)
+        if (msg.internetMessageId) {
+          ids.set(`iid:${msg.internetMessageId}`, true);
+        }
+        // Chave secundária: conversationId + subject + data (fallback para mensagens sem internetMessageId)
+        if (msg.conversationId && msg.subject && msg.sentDateTime) {
+          const key = `conv:${msg.conversationId}:${msg.subject}:${msg.sentDateTime}`;
+          ids.set(key, true);
+        }
       }
     } catch (e) {
       this.logger.warn(`Could not build target index for dedup: ${e.message}`);
@@ -211,7 +219,7 @@ class EmailMigrator {
         {
           '$top': this.pageSize,
           '$skip': skip,
-          '$select': 'id,internetMessageId,subject,receivedDateTime,sentDateTime,isRead,isDraft,flag,importance,body,from,toRecipients,ccRecipients,bccRecipients,replyTo,internetMessageHeaders'
+          '$select': 'id,internetMessageId,conversationId,subject,receivedDateTime,sentDateTime,isRead,isDraft,flag,importance,body,from,toRecipients,ccRecipients,bccRecipients,replyTo'
         }
       );
 
@@ -229,8 +237,23 @@ class EmailMigrator {
           continue;
         }
 
-        // Skip 2: already in target (dedup)
-        if (msg.internetMessageId && targetIndex.has(msg.internetMessageId)) {
+        // Skip 2: already in target (dedup com múltiplas estratégias)
+        let isDuplicate = false;
+        
+        // Estratégia 1: internetMessageId (mais confiável)
+        if (msg.internetMessageId && targetIndex.has(`iid:${msg.internetMessageId}`)) {
+          isDuplicate = true;
+        }
+        
+        // Estratégia 2: conversationId + subject + data (fallback)
+        if (!isDuplicate && msg.conversationId && msg.subject && msg.sentDateTime) {
+          const key = `conv:${msg.conversationId}:${msg.subject}:${msg.sentDateTime}`;
+          if (targetIndex.has(key)) {
+            isDuplicate = true;
+          }
+        }
+        
+        if (isDuplicate) {
           this.logger.info(`⏭  Duplicate: "${msg.subject}"`);
           checkpoint[msgKey] = 'done';
           stats.skipped++;
@@ -247,7 +270,14 @@ class EmailMigrator {
 
         try {
           await this._createMessage(tgtEmail, tgtFolderId, msg);
-          if (msg.internetMessageId) targetIndex.add(msg.internetMessageId);
+          // Adiciona ao índice após criar
+          if (msg.internetMessageId) {
+            targetIndex.set(`iid:${msg.internetMessageId}`, true);
+          }
+          if (msg.conversationId && msg.subject && msg.sentDateTime) {
+            const key = `conv:${msg.conversationId}:${msg.subject}:${msg.sentDateTime}`;
+            targetIndex.set(key, true);
+          }
           checkpoint[msgKey] = 'done';
           stats.migrated++;
           processedCount++;
