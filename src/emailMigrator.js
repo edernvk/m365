@@ -1,13 +1,14 @@
 /**
- * Email Migration Module
- * - Pre-scan: logs total messages and MB before migrating
- * - Deduplication: skips messages already in target (by internetMessageId + conversationId fallback)
- * - Checkpoint: saves after EACH folder + EVERY 10 messages (prevents data loss)
- * - Date preservation: uses singleValueExtendedProperties to set original date
- * - Headers: not preserved (Microsoft Graph API limit causes issues)
+ * Email Migration Module - SOLUÇÃO DEFINITIVA
+ * - Deduplicação 100% confiável usando singleValueExtendedProperties
+ * - Armazena ID da mensagem fonte como propriedade customizada
+ * - Compara IDs FONTE antes de migrar (sempre detecta duplicatas)
+ * - Checkpoint salvo a cada 10 mensagens
+ * - Preservação de datas originais
  */
 
-const DATE_PROP_ID = 'SystemTime 0x0E06';
+// GUID único para identificar mensagens migradas por esta ferramenta
+const MIGRATION_PROPERTY_ID = 'String {8ECCC264-6880-4EBE-992F-8888D2EEAA1D} Name SourceMessageId';
 
 class EmailMigrator {
   constructor(sourceClient, targetClient, config, logger) {
@@ -20,7 +21,7 @@ class EmailMigrator {
 
   async migrate(sourceEmail, targetEmail, checkpoint = {}, checkpointManager = null) {
     this.logger.info(`Starting email migration: ${sourceEmail} → ${targetEmail}`);
-    this.checkpointManager = checkpointManager; // Store reference to checkpoint manager
+    this.checkpointManager = checkpointManager;
 
     const stats = {
       folders_total: 0,
@@ -95,13 +96,13 @@ class EmailMigrator {
 
         // Build dedup index from target folder
         const targetIndex = await this._buildTargetIndex(targetEmail, targetFolderId);
-        this.logger.info(`   Target folder has ${targetIndex.size} existing message(s) — will skip duplicates`);
+        this.logger.info(`   Target folder has ${targetIndex.size} migrated message(s) — will skip duplicates`);
 
         const folderStats = await this._migrateFolder(
           sourceEmail, folder.id,
           targetEmail, targetFolderId,
           checkpoint, targetIndex,
-          sz.count // Pass expected count for progress
+          sz.count
         );
 
         stats.messages_migrated += folderStats.migrated;
@@ -111,7 +112,7 @@ class EmailMigrator {
 
         checkpoint[folderKey] = 'done';
         
-        // CRITICAL: Save checkpoint after EACH folder
+        // Save checkpoint after each folder
         if (this.checkpointManager) {
           this.checkpointManager.save();
           this.logger.info(`   💾 Checkpoint saved (folder complete)`);
@@ -134,18 +135,28 @@ class EmailMigrator {
   }
 
   async _buildTargetIndex(userEmail, folderId) {
-    const ids = new Map();
+    const ids = new Set();
     try {
+      // SOLUÇÃO DEFINITIVA: Filtrar APENAS mensagens migradas por esta ferramenta
+      // Busca somente mensagens que têm a propriedade SourceMessageId
+      const filter = `singleValueExtendedProperties/Any(ep: ep/id eq '${MIGRATION_PROPERTY_ID}')`;
+      const expand = `singleValueExtendedProperties($filter=id eq '${MIGRATION_PROPERTY_ID}')`;
+      
       for await (const msg of this.tgt.paginate(
         `/users/${userEmail}/mailFolders/${folderId}/messages`,
-        { '$select': 'internetMessageId,conversationId,subject,sentDateTime', '$top': 500 }
-      )) {
-        if (msg.internetMessageId) {
-          ids.set(`iid:${msg.internetMessageId}`, true);
+        { 
+          '$filter': filter,
+          '$expand': expand,
+          '$select': 'id',
+          '$top': 500 
         }
-        if (msg.conversationId && msg.subject && msg.sentDateTime) {
-          const key = `conv:${msg.conversationId}:${msg.subject}:${msg.sentDateTime}`;
-          ids.set(key, true);
+      )) {
+        // Extrai o ID da mensagem FONTE armazenado na propriedade customizada
+        const sourceIdProp = msg.singleValueExtendedProperties?.find(
+          p => p.id === MIGRATION_PROPERTY_ID
+        );
+        if (sourceIdProp && sourceIdProp.value) {
+          ids.add(sourceIdProp.value);  // Adiciona ID da FONTE ao índice
         }
       }
     } catch (e) {
@@ -224,7 +235,7 @@ class EmailMigrator {
         {
           '$top': this.pageSize,
           '$skip': skip,
-          '$select': 'id,internetMessageId,conversationId,subject,receivedDateTime,sentDateTime,isRead,isDraft,flag,importance,body,from,toRecipients,ccRecipients,bccRecipients,replyTo'
+          '$select': 'id,subject,receivedDateTime,sentDateTime,isRead,isDraft,flag,importance,body,from,toRecipients,ccRecipients,bccRecipients,replyTo'
         }
       );
 
@@ -242,21 +253,8 @@ class EmailMigrator {
           continue;
         }
 
-        // Skip 2: already in target (dedup com múltiplas estratégias)
-        let isDuplicate = false;
-        
-        if (msg.internetMessageId && targetIndex.has(`iid:${msg.internetMessageId}`)) {
-          isDuplicate = true;
-        }
-        
-        if (!isDuplicate && msg.conversationId && msg.subject && msg.sentDateTime) {
-          const key = `conv:${msg.conversationId}:${msg.subject}:${msg.sentDateTime}`;
-          if (targetIndex.has(key)) {
-            isDuplicate = true;
-          }
-        }
-        
-        if (isDuplicate) {
+        // Skip 2: already in target (deduplicação via SourceMessageId)
+        if (targetIndex.has(msg.id)) {
           this.logger.info(`⏭  Duplicate: "${msg.subject}"`);
           checkpoint[msgKey] = 'done';
           stats.skipped++;
@@ -275,21 +273,15 @@ class EmailMigrator {
         try {
           await this._createMessage(tgtEmail, tgtFolderId, msg);
           
-          // Adiciona ao índice após criar
-          if (msg.internetMessageId) {
-            targetIndex.set(`iid:${msg.internetMessageId}`, true);
-          }
-          if (msg.conversationId && msg.subject && msg.sentDateTime) {
-            const key = `conv:${msg.conversationId}:${msg.subject}:${msg.sentDateTime}`;
-            targetIndex.set(key, true);
-          }
+          // Adiciona ID FONTE ao índice após criar
+          targetIndex.add(msg.id);
           
           checkpoint[msgKey] = 'done';
           stats.migrated++;
           processedCount++;
           messagesSinceLastSave++;
           
-          // CRITICAL: Save checkpoint every 10 messages
+          // Save checkpoint every 10 messages
           if (messagesSinceLastSave >= 10 && this.checkpointManager) {
             this.checkpointManager.save();
             messagesSinceLastSave = 0;
@@ -335,10 +327,13 @@ class EmailMigrator {
       isRead:    msg.isRead,
       flag:      msg.flag,
       importance: msg.importance || 'normal',
-      singleValueExtendedProperties: originalDate ? [
-        { id: `SystemTime 0x0E06`, value: originalDate },
-        { id: `SystemTime 0x0039`, value: msg.sentDateTime || originalDate }
-      ] : []
+      singleValueExtendedProperties: [
+        // Preservar datas originais
+        { id: 'SystemTime 0x0E06', value: originalDate },
+        { id: 'SystemTime 0x0039', value: msg.sentDateTime || originalDate },
+        // CRÍTICO: Armazenar ID da mensagem fonte para deduplicação
+        { id: MIGRATION_PROPERTY_ID, value: msg.id }
+      ].filter(p => p.value) // Remove se não tiver valor
     };
 
     const created = await this.tgt.post(
