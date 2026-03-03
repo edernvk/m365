@@ -332,6 +332,7 @@ class EmailMigrator {
       receivedDateTime: msg.receivedDateTime,
       sentDateTime: msg.sentDateTime,
       isRead:    msg.isRead,
+      isDraft:   false, // OTIMIZAÇÃO: Criar já como não-draft (economiza 1 PATCH por mensagem!)
       flag:      msg.flag,
       importance: msg.importance || 'normal',
       singleValueExtendedProperties: [
@@ -348,12 +349,8 @@ class EmailMigrator {
       payload
     );
 
-    if (!msg.isDraft) {
-      await this.tgt.patch(
-        `/users/${userEmail}/messages/${created.id}`,
-        { isDraft: false }
-      );
-    }
+    // REMOVIDO: PATCH para marcar como não-draft (já criamos assim!)
+    // Economiza ~150-300ms por mensagem
 
     return created;
   }
