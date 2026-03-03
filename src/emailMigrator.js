@@ -99,8 +99,8 @@ class EmailMigrator {
         const targetFolderId = await this._ensureFolder(targetEmail, folder.displayName);
 
         // Build dedup index from target folder
-        const targetIndex = await this._buildTargetIndex(targetEmail, targetFolderId);
-        this.logger.info(`   Target folder has ${targetIndex.size} migrated message(s) — will skip duplicates`);
+        const targetIndex = await this._buildTargetIndex(targetEmail, targetFolderId, folder.displayName);
+        this.logger.info(`   ✅ Found ${targetIndex.size} previously migrated message(s) in this folder`);
 
         const folderStats = await this._migrateFolder(
           sourceEmail, folder.id,
@@ -138,10 +138,10 @@ class EmailMigrator {
     }
   }
 
-  async _buildTargetIndex(userEmail, folderId) {
+  async _buildTargetIndex(userEmail, folderId, folderName = 'folder') {
     const ids = new Set();
     try {
-      this.logger.info(`   🔍 Checking for existing migrated messages...`);
+      this.logger.info(`   🔍 Checking existing messages in "${folderName}"...`);
       
       // SOLUÇÃO CORRIGIDA: Busca todas as mensagens e expande a propriedade customizada
       // Graph API não permite filtrar apenas por existência da propriedade
@@ -153,7 +153,8 @@ class EmailMigrator {
           '$expand': expand,
           '$select': 'id',
           '$top': 500 
-        }
+        },
+        'existing messages'
       )) {
         // Extrai o ID da mensagem FONTE armazenado na propriedade customizada
         const sourceIdProp = msg.singleValueExtendedProperties?.find(
@@ -174,7 +175,7 @@ class EmailMigrator {
   async _getAllFolders(userEmail) {
     const folders = [];
     const topFolders = [];
-    for await (const f of this.src.paginate(`/users/${userEmail}/mailFolders`)) {
+    for await (const f of this.src.paginate(`/users/${userEmail}/mailFolders`, {}, 'folders')) {
       topFolders.push(f);
     }
     for (const folder of topFolders) {
@@ -187,7 +188,7 @@ class EmailMigrator {
 
   async _getChildFolders(userEmail, parentId) {
     const children = [];
-    for await (const f of this.src.paginate(`/users/${userEmail}/mailFolders/${parentId}/childFolders`)) {
+    for await (const f of this.src.paginate(`/users/${userEmail}/mailFolders/${parentId}/childFolders`, {}, 'child folders')) {
       children.push(f);
       const nested = await this._getChildFolders(userEmail, f.id);
       children.push(...nested);
@@ -214,7 +215,7 @@ class EmailMigrator {
     }
 
     try {
-      for await (const f of this.tgt.paginate(`/users/${userEmail}/mailFolders`)) {
+      for await (const f of this.tgt.paginate(`/users/${userEmail}/mailFolders`, {}, 'target folders')) {
         if (f.displayName === folderName) return f.id;
       }
     } catch (e) { /* ignore */ }

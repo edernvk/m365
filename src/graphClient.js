@@ -8,7 +8,7 @@ class GraphClient {
     this.auth = authInstance;
     this.retryAttempts = config.retry_attempts || 5;
     this.retryDelay = config.retry_delay_ms || 2000;
-    this.throttleDelay = config.throttle_delay_ms || 1000;
+    this.throttleDelay = config.throttle_delay_ms || 200; // Reduzido de 1000ms para 200ms
     this.logger = logger;
     this.requestCount = 0;
   }
@@ -29,6 +29,7 @@ class GraphClient {
       const fullUrl = url.startsWith('http') ? url : `${GRAPH_BASE}${url}`;
       
       this.requestCount++;
+      const reqId = this.requestCount;
 
       const startTime = Date.now();
       const response = await axios({
@@ -45,10 +46,12 @@ class GraphClient {
 
       const duration = Date.now() - startTime;
       
-      // Log apenas responses bem-sucedidas de forma compacta
+      // Log apenas a cada 5 requisições bem-sucedidas (reduz poluição)
       if (response.status >= 200 && response.status < 300) {
-        const operation = method === 'GET' ? '📥' : method === 'POST' ? '📤' : '🔄';
-        this._log('info', `   ${operation} API OK: HTTP ${response.status} (${duration}ms)`);
+        if (reqId % 5 === 0 || duration > 3000) { // A cada 5 OU se demorou muito
+          const operation = method === 'GET' ? '📥' : method === 'POST' ? '📤' : '🔄';
+          this._log('info', `   ${operation} API: HTTP ${response.status} (${duration}ms)`);
+        }
       }
 
       // 429 = Too Many Requests (throttled)
@@ -150,7 +153,7 @@ class GraphClient {
   }
 
   // Paginate through all pages of a Graph API collection
-  async *paginate(url, params = {}) {
+  async *paginate(url, params = {}, context = 'items') {
     let nextUrl = url;
     let isFirst = true;
     let pageNum = 0;
@@ -173,9 +176,9 @@ class GraphClient {
       nextUrl = result['@odata.nextLink'] || null;
     }
     
-    // Log apenas resumo final
+    // Log apenas resumo final com contexto
     if (totalItems > 0) {
-      this._log('info', `   📦 Loaded ${totalItems} item(s) from ${pageNum} page(s)`);
+      this._log('info', `   📦 Loaded ${totalItems} ${context} (${pageNum} page${pageNum > 1 ? 's' : ''})`);
     }
   }
 }
