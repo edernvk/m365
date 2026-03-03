@@ -2,12 +2,11 @@
  * Email Migration Module
  * - Pre-scan: logs total messages and MB before migrating
  * - Deduplication: skips messages already in target (by internetMessageId + conversationId fallback)
- * - Checkpoint: skips already migrated messages on resume
+ * - Checkpoint: saves after EACH folder + EVERY 10 messages (prevents data loss)
  * - Date preservation: uses singleValueExtendedProperties to set original date
  * - Headers: not preserved (Microsoft Graph API limit causes issues)
  */
 
-// Extended property ID used by Outlook to store the sent/received date (PR_MESSAGE_DELIVERY_TIME)
 const DATE_PROP_ID = 'SystemTime 0x0E06';
 
 class EmailMigrator {
@@ -19,8 +18,9 @@ class EmailMigrator {
     this.pageSize = config.email_page_size || 100;
   }
 
-  async migrate(sourceEmail, targetEmail, checkpoint = {}) {
+  async migrate(sourceEmail, targetEmail, checkpoint = {}, checkpointManager = null) {
     this.logger.info(`Starting email migration: ${sourceEmail} → ${targetEmail}`);
+    this.checkpointManager = checkpointManager; // Store reference to checkpoint manager
 
     const stats = {
       folders_total: 0,
@@ -110,6 +110,12 @@ class EmailMigrator {
         stats.folders_done++;
 
         checkpoint[folderKey] = 'done';
+        
+        // CRITICAL: Save checkpoint after EACH folder
+        if (this.checkpointManager) {
+          this.checkpointManager.save();
+          this.logger.info(`   💾 Checkpoint saved (folder complete)`);
+        }
 
         this.logger.info(
           `   ✓ ${folder.displayName}: ${folderStats.migrated} migrated, ${folderStats.skipped} skipped, ${folderStats.failed} failed`
@@ -128,17 +134,15 @@ class EmailMigrator {
   }
 
   async _buildTargetIndex(userEmail, folderId) {
-    const ids = new Map(); // Mudou de Set para Map para armazenar diferentes tipos de chaves
+    const ids = new Map();
     try {
       for await (const msg of this.tgt.paginate(
         `/users/${userEmail}/mailFolders/${folderId}/messages`,
         { '$select': 'internetMessageId,conversationId,subject,sentDateTime', '$top': 500 }
       )) {
-        // Chave primária: internetMessageId (quando existe)
         if (msg.internetMessageId) {
           ids.set(`iid:${msg.internetMessageId}`, true);
         }
-        // Chave secundária: conversationId + subject + data (fallback para mensagens sem internetMessageId)
         if (msg.conversationId && msg.subject && msg.sentDateTime) {
           const key = `conv:${msg.conversationId}:${msg.subject}:${msg.sentDateTime}`;
           ids.set(key, true);
@@ -212,6 +216,7 @@ class EmailMigrator {
     const stats = { total: 0, migrated: 0, skipped: 0, failed: 0 };
     let skip = 0;
     let processedCount = 0;
+    let messagesSinceLastSave = 0;
 
     while (true) {
       const result = await this.src.get(
@@ -240,12 +245,10 @@ class EmailMigrator {
         // Skip 2: already in target (dedup com múltiplas estratégias)
         let isDuplicate = false;
         
-        // Estratégia 1: internetMessageId (mais confiável)
         if (msg.internetMessageId && targetIndex.has(`iid:${msg.internetMessageId}`)) {
           isDuplicate = true;
         }
         
-        // Estratégia 2: conversationId + subject + data (fallback)
         if (!isDuplicate && msg.conversationId && msg.subject && msg.sentDateTime) {
           const key = `conv:${msg.conversationId}:${msg.subject}:${msg.sentDateTime}`;
           if (targetIndex.has(key)) {
@@ -258,6 +261,7 @@ class EmailMigrator {
           checkpoint[msgKey] = 'done';
           stats.skipped++;
           processedCount++;
+          messagesSinceLastSave++;
           continue;
         }
 
@@ -270,6 +274,7 @@ class EmailMigrator {
 
         try {
           await this._createMessage(tgtEmail, tgtFolderId, msg);
+          
           // Adiciona ao índice após criar
           if (msg.internetMessageId) {
             targetIndex.set(`iid:${msg.internetMessageId}`, true);
@@ -278,11 +283,19 @@ class EmailMigrator {
             const key = `conv:${msg.conversationId}:${msg.subject}:${msg.sentDateTime}`;
             targetIndex.set(key, true);
           }
+          
           checkpoint[msgKey] = 'done';
           stats.migrated++;
           processedCount++;
+          messagesSinceLastSave++;
           
-          // Progress indicator every 10 messages or at specific milestones
+          // CRITICAL: Save checkpoint every 10 messages
+          if (messagesSinceLastSave >= 10 && this.checkpointManager) {
+            this.checkpointManager.save();
+            messagesSinceLastSave = 0;
+          }
+          
+          // Progress indicator every 10 messages
           if (processedCount % 10 === 0 && expectedCount > 0) {
             const percentage = Math.min(100, Math.round((processedCount / expectedCount) * 100));
             this.logger.info(`   ⏳ Progress: ${processedCount}/${expectedCount} (${percentage}%) | ✓ ${stats.migrated} migrated, ⏭ ${stats.skipped} skipped, ✗ ${stats.failed} failed`);
@@ -297,12 +310,16 @@ class EmailMigrator {
       if (messages.length < this.pageSize) break;
       skip += this.pageSize;
     }
+    
+    // Final save for this folder
+    if (messagesSinceLastSave > 0 && this.checkpointManager) {
+      this.checkpointManager.save();
+    }
 
     return stats;
   }
 
   async _createMessage(userEmail, folderId, msg) {
-    // Use the original received date, fall back to sent date
     const originalDate = msg.receivedDateTime || msg.sentDateTime;
 
     const payload = {
@@ -318,8 +335,6 @@ class EmailMigrator {
       isRead:    msg.isRead,
       flag:      msg.flag,
       importance: msg.importance || 'normal',
-      // singleValueExtendedProperties pins the displayed date in Outlook
-      // PR_MESSAGE_DELIVERY_TIME (0x0E06) = the timestamp shown in the inbox list
       singleValueExtendedProperties: originalDate ? [
         { id: `SystemTime 0x0E06`, value: originalDate },
         { id: `SystemTime 0x0039`, value: msg.sentDateTime || originalDate }
