@@ -141,13 +141,12 @@ class EmailMigrator {
   async _buildTargetIndex(userEmail, folderId) {
     const ids = new Set();
     try {
-      this.logger.info(`   🔍 Building deduplication index from target folder...`);
+      this.logger.info(`   🔍 Checking for existing migrated messages...`);
       
       // SOLUÇÃO CORRIGIDA: Busca todas as mensagens e expande a propriedade customizada
       // Graph API não permite filtrar apenas por existência da propriedade
       const expand = `singleValueExtendedProperties($filter=id eq '${MIGRATION_PROPERTY_ID}')`;
       
-      let pageCount = 0;
       for await (const msg of this.tgt.paginate(
         `/users/${userEmail}/mailFolders/${folderId}/messages`,
         { 
@@ -156,11 +155,6 @@ class EmailMigrator {
           '$top': 500 
         }
       )) {
-        pageCount++;
-        if (pageCount % 5 === 0) {
-          this.logger.info(`      📄 Scanned ${ids.size} migrated messages so far...`);
-        }
-        
         // Extrai o ID da mensagem FONTE armazenado na propriedade customizada
         const sourceIdProp = msg.singleValueExtendedProperties?.find(
           p => p.id === MIGRATION_PROPERTY_ID
@@ -171,8 +165,6 @@ class EmailMigrator {
         }
         // Se não tem a propriedade, ignora (não foi migrada por esta ferramenta)
       }
-      
-      this.logger.info(`   ✅ Index built: ${ids.size} migrated message(s) found`);
     } catch (e) {
       this.logger.warn(`Could not build target index for dedup: ${e.message}`);
     }
@@ -244,8 +236,6 @@ class EmailMigrator {
     let messagesSinceLastSave = 0;
 
     while (true) {
-      this.logger.info(`   📥 Fetching messages (skip=${skip}, pageSize=${this.pageSize})...`);
-      
       const result = await this.src.get(
         `/users/${srcEmail}/mailFolders/${srcFolderId}/messages`,
         {
@@ -256,7 +246,6 @@ class EmailMigrator {
       );
 
       const messages = result.value || [];
-      this.logger.info(`   📬 Received ${messages.length} message(s) from source`);
       
       if (messages.length === 0) break;
       stats.total += messages.length;
@@ -273,7 +262,6 @@ class EmailMigrator {
 
         // Skip 2: already in target (deduplicação via SourceMessageId)
         if (targetIndex.has(msg.id)) {
-          this.logger.info(`⏭  Duplicate: "${msg.subject}"`);
           checkpoint[msgKey] = 'done';
           stats.skipped++;
           processedCount++;

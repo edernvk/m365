@@ -29,11 +29,6 @@ class GraphClient {
       const fullUrl = url.startsWith('http') ? url : `${GRAPH_BASE}${url}`;
       
       this.requestCount++;
-      const reqId = this.requestCount;
-      
-      // Log detalhado da requisição
-      const urlShort = fullUrl.length > 100 ? fullUrl.substring(0, 100) + '...' : fullUrl;
-      this._log('info', `   🌐 API Request #${reqId}: ${method} ${urlShort}`);
 
       const startTime = Date.now();
       const response = await axios({
@@ -49,19 +44,24 @@ class GraphClient {
       });
 
       const duration = Date.now() - startTime;
-      this._log('info', `   ✅ API Response #${reqId}: HTTP ${response.status} (${duration}ms)`);
+      
+      // Log apenas responses bem-sucedidas de forma compacta
+      if (response.status >= 200 && response.status < 300) {
+        const operation = method === 'GET' ? '📥' : method === 'POST' ? '📤' : '🔄';
+        this._log('info', `   ${operation} API OK: HTTP ${response.status} (${duration}ms)`);
+      }
 
       // 429 = Too Many Requests (throttled)
       if (response.status === 429) {
         const retryAfter = parseInt(response.headers['retry-after'] || '10') * 1000;
-        this._log('warn', `   ⏸️  Rate limited! Waiting ${retryAfter/1000}s before retry...`);
+        this._log('warn', `   ⏸️  Rate limited! Waiting ${retryAfter/1000}s...`);
         await this._sleep(retryAfter);
         return this.request(method, url, data, extraHeaders, attempt, responseType);
       }
 
       // 503 or 504 = retry
       if ((response.status === 503 || response.status === 504) && attempt <= this.retryAttempts) {
-        this._log('warn', `   🔄 Server error ${response.status}, retrying (attempt ${attempt}/${this.retryAttempts})...`);
+        this._log('warn', `   🔄 Server error ${response.status}, retrying (${attempt}/${this.retryAttempts})...`);
         await this._sleep(this.retryDelay * attempt);
         return this.request(method, url, data, extraHeaders, attempt + 1, responseType);
       }
@@ -102,7 +102,7 @@ class GraphClient {
       if (err.code === 'ECONNABORTED' && err.message.includes('timeout')) {
         this._log('error', `   ⏱️  Request timeout after ${REQUEST_TIMEOUT/1000}s!`);
         if (attempt <= this.retryAttempts) {
-          this._log('warn', `   🔄 Retrying timeout (attempt ${attempt}/${this.retryAttempts})...`);
+          this._log('warn', `   🔄 Retrying (${attempt}/${this.retryAttempts})...`);
           await this._sleep(this.retryDelay * attempt);
           return this.request(method, url, data, extraHeaders, attempt + 1, responseType);
         }
@@ -113,7 +113,7 @@ class GraphClient {
       if (err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT') {
         this._log('warn', `   🔌 Network error: ${err.code}`);
         if (attempt <= this.retryAttempts) {
-          this._log('warn', `   🔄 Retrying network error (attempt ${attempt}/${this.retryAttempts})...`);
+          this._log('warn', `   🔄 Retrying (${attempt}/${this.retryAttempts})...`);
           await this._sleep(this.retryDelay * attempt);
           return this.request(method, url, data, extraHeaders, attempt + 1, responseType);
         }
@@ -154,10 +154,10 @@ class GraphClient {
     let nextUrl = url;
     let isFirst = true;
     let pageNum = 0;
+    let totalItems = 0;
 
     while (nextUrl) {
       pageNum++;
-      this._log('info', `   📄 Fetching page ${pageNum}...`);
       
       const result = isFirst
         ? await this.get(url, params)
@@ -166,17 +166,16 @@ class GraphClient {
       isFirst = false;
       
       if (result.value) {
-        this._log('info', `   📦 Page ${pageNum}: ${result.value.length} items`);
+        totalItems += result.value.length;
         yield* result.value;
       }
       
       nextUrl = result['@odata.nextLink'] || null;
-      
-      if (nextUrl) {
-        this._log('info', `   ➡️  More pages available, continuing...`);
-      } else {
-        this._log('info', `   ✅ Pagination complete (${pageNum} page(s))`);
-      }
+    }
+    
+    // Log apenas resumo final
+    if (totalItems > 0) {
+      this._log('info', `   📦 Loaded ${totalItems} item(s) from ${pageNum} page(s)`);
     }
   }
 }
