@@ -1,44 +1,67 @@
 const axios = require('axios');
 
 const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
+const REQUEST_TIMEOUT = 120000; // 120 segundos
 
 class GraphClient {
-  constructor(authInstance, config) {
+  constructor(authInstance, config, logger = null) {
     this.auth = authInstance;
     this.retryAttempts = config.retry_attempts || 5;
     this.retryDelay = config.retry_delay_ms || 2000;
     this.throttleDelay = config.throttle_delay_ms || 1000;
+    this.logger = logger;
+    this.requestCount = 0;
   }
 
   async _sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
+  _log(level, message) {
+    if (this.logger) {
+      this.logger[level](message);
+    }
+  }
+
   async request(method, url, data = null, extraHeaders = {}, attempt = 1, responseType = 'json') {
     try {
       const headers = await this.auth.getHeaders();
       const fullUrl = url.startsWith('http') ? url : `${GRAPH_BASE}${url}`;
+      
+      this.requestCount++;
+      const reqId = this.requestCount;
+      
+      // Log detalhado da requisição
+      const urlShort = fullUrl.length > 100 ? fullUrl.substring(0, 100) + '...' : fullUrl;
+      this._log('info', `   🌐 API Request #${reqId}: ${method} ${urlShort}`);
 
+      const startTime = Date.now();
       const response = await axios({
         method,
         url: fullUrl,
         headers: { ...headers, ...extraHeaders },
         data: data || undefined,
         responseType,
+        timeout: REQUEST_TIMEOUT,
         maxContentLength: Infinity,
         maxBodyLength: Infinity,
         validateStatus: null
       });
 
+      const duration = Date.now() - startTime;
+      this._log('info', `   ✅ API Response #${reqId}: HTTP ${response.status} (${duration}ms)`);
+
       // 429 = Too Many Requests (throttled)
       if (response.status === 429) {
         const retryAfter = parseInt(response.headers['retry-after'] || '10') * 1000;
+        this._log('warn', `   ⏸️  Rate limited! Waiting ${retryAfter/1000}s before retry...`);
         await this._sleep(retryAfter);
         return this.request(method, url, data, extraHeaders, attempt, responseType);
       }
 
       // 503 or 504 = retry
       if ((response.status === 503 || response.status === 504) && attempt <= this.retryAttempts) {
+        this._log('warn', `   🔄 Server error ${response.status}, retrying (attempt ${attempt}/${this.retryAttempts})...`);
         await this._sleep(this.retryDelay * attempt);
         return this.request(method, url, data, extraHeaders, attempt + 1, responseType);
       }
@@ -69,15 +92,28 @@ class GraphClient {
         try {
           return JSON.parse(response.data);
         } catch (e) {
-          // Not JSON, return as is
           return response.data;
         }
       }
       return response.data;
 
     } catch (err) {
-      if (err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT') {
+      // Timeout específico
+      if (err.code === 'ECONNABORTED' && err.message.includes('timeout')) {
+        this._log('error', `   ⏱️  Request timeout after ${REQUEST_TIMEOUT/1000}s!`);
         if (attempt <= this.retryAttempts) {
+          this._log('warn', `   🔄 Retrying timeout (attempt ${attempt}/${this.retryAttempts})...`);
+          await this._sleep(this.retryDelay * attempt);
+          return this.request(method, url, data, extraHeaders, attempt + 1, responseType);
+        }
+        throw new Error(`Request timeout after ${this.retryAttempts} attempts`);
+      }
+      
+      // Network errors
+      if (err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT') {
+        this._log('warn', `   🔌 Network error: ${err.code}`);
+        if (attempt <= this.retryAttempts) {
+          this._log('warn', `   🔄 Retrying network error (attempt ${attempt}/${this.retryAttempts})...`);
           await this._sleep(this.retryDelay * attempt);
           return this.request(method, url, data, extraHeaders, attempt + 1, responseType);
         }
@@ -117,15 +153,30 @@ class GraphClient {
   async *paginate(url, params = {}) {
     let nextUrl = url;
     let isFirst = true;
+    let pageNum = 0;
 
     while (nextUrl) {
+      pageNum++;
+      this._log('info', `   📄 Fetching page ${pageNum}...`);
+      
       const result = isFirst
         ? await this.get(url, params)
         : await this.request('GET', nextUrl);
 
       isFirst = false;
-      if (result.value) yield* result.value;
+      
+      if (result.value) {
+        this._log('info', `   📦 Page ${pageNum}: ${result.value.length} items`);
+        yield* result.value;
+      }
+      
       nextUrl = result['@odata.nextLink'] || null;
+      
+      if (nextUrl) {
+        this._log('info', `   ➡️  More pages available, continuing...`);
+      } else {
+        this._log('info', `   ✅ Pagination complete (${pageNum} page(s))`);
+      }
     }
   }
 }
