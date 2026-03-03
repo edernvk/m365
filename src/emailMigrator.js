@@ -137,15 +137,13 @@ class EmailMigrator {
   async _buildTargetIndex(userEmail, folderId) {
     const ids = new Set();
     try {
-      // SOLUÇÃO DEFINITIVA: Filtrar APENAS mensagens migradas por esta ferramenta
-      // Busca somente mensagens que têm a propriedade SourceMessageId
-      const filter = `singleValueExtendedProperties/Any(ep: ep/id eq '${MIGRATION_PROPERTY_ID}')`;
+      // SOLUÇÃO CORRIGIDA: Busca todas as mensagens e expande a propriedade customizada
+      // Graph API não permite filtrar apenas por existência da propriedade
       const expand = `singleValueExtendedProperties($filter=id eq '${MIGRATION_PROPERTY_ID}')`;
       
       for await (const msg of this.tgt.paginate(
         `/users/${userEmail}/mailFolders/${folderId}/messages`,
         { 
-          '$filter': filter,
           '$expand': expand,
           '$select': 'id',
           '$top': 500 
@@ -156,8 +154,10 @@ class EmailMigrator {
           p => p.id === MIGRATION_PROPERTY_ID
         );
         if (sourceIdProp && sourceIdProp.value) {
-          ids.add(sourceIdProp.value);  // Adiciona ID da FONTE ao índice
+          // Esta mensagem foi migrada - adiciona ID da FONTE ao índice
+          ids.add(sourceIdProp.value);
         }
+        // Se não tem a propriedade, ignora (não foi migrada por esta ferramenta)
       }
     } catch (e) {
       this.logger.warn(`Could not build target index for dedup: ${e.message}`);
