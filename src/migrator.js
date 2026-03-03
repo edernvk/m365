@@ -86,7 +86,8 @@ async function main() {
   const tgtClient = new GraphClient(tgtAuth, config.migration);
 
   // Checkpoint manager
-  const checkpoint = new CheckpointManager(config.checkpoint_file || './resume.json');
+  const checkpointPath = path.resolve(process.cwd(), config.checkpoint_file || 'resume.json');
+  const checkpoint = new CheckpointManager(checkpointPath);
   if (RESET) {
     checkpoint.reset(ONLY_USER || null);
     mainLogger.info('Checkpoint reset');

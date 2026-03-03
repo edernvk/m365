@@ -1,10 +1,14 @@
 /**
  * Email Migration Module
- * - Pre-scan: logs total messages and estimated MB before migrating
+ * - Pre-scan: logs total messages and MB before migrating
  * - Deduplication: skips messages already in target (by internetMessageId)
  * - Checkpoint: skips already migrated messages on resume
- * - Header sanitization: only x- prefixed, deduplicated, max 5
+ * - Date preservation: uses singleValueExtendedProperties to set original date
+ * - Headers: not preserved (Microsoft Graph API limit causes issues)
  */
+
+// Extended property ID used by Outlook to store the sent/received date (PR_MESSAGE_DELIVERY_TIME)
+const DATE_PROP_ID = 'SystemTime 0x0E06';
 
 class EmailMigrator {
   constructor(sourceClient, targetClient, config, logger) {
@@ -84,7 +88,7 @@ class EmailMigrator {
 
         const sz = folderSizes[folder.id] || { count: 0, bytes: 0 };
         this.logger.info(
-          `📂 Migrating: ${folder.displayName} (${sz.count} msgs / ${this._formatBytes(sz.bytes)})`
+          `📂 Migrating [${stats.folders_done + 1}/${folders.length}]: ${folder.displayName} (${sz.count} msgs / ${this._formatBytes(sz.bytes)})`
         );
 
         const targetFolderId = await this._ensureFolder(targetEmail, folder.displayName);
@@ -96,7 +100,8 @@ class EmailMigrator {
         const folderStats = await this._migrateFolder(
           sourceEmail, folder.id,
           targetEmail, targetFolderId,
-          checkpoint, targetIndex
+          checkpoint, targetIndex,
+          sz.count // Pass expected count for progress
         );
 
         stats.messages_migrated += folderStats.migrated;
@@ -195,9 +200,10 @@ class EmailMigrator {
     }
   }
 
-  async _migrateFolder(srcEmail, srcFolderId, tgtEmail, tgtFolderId, checkpoint, targetIndex) {
+  async _migrateFolder(srcEmail, srcFolderId, tgtEmail, tgtFolderId, checkpoint, targetIndex, expectedCount = 0) {
     const stats = { total: 0, migrated: 0, skipped: 0, failed: 0 };
     let skip = 0;
+    let processedCount = 0;
 
     while (true) {
       const result = await this.src.get(
@@ -205,7 +211,7 @@ class EmailMigrator {
         {
           '$top': this.pageSize,
           '$skip': skip,
-          '$select': 'id,internetMessageId,subject,receivedDateTime,isRead,isDraft,flag,importance,body,from,toRecipients,ccRecipients,bccRecipients,replyTo,internetMessageHeaders'
+          '$select': 'id,internetMessageId,subject,receivedDateTime,sentDateTime,isRead,isDraft,flag,importance,body,from,toRecipients,ccRecipients,bccRecipients,replyTo,internetMessageHeaders'
         }
       );
 
@@ -219,6 +225,7 @@ class EmailMigrator {
         // Skip 1: checkpoint
         if (checkpoint[msgKey]) {
           stats.skipped++;
+          processedCount++;
           continue;
         }
 
@@ -227,23 +234,33 @@ class EmailMigrator {
           this.logger.info(`⏭  Duplicate: "${msg.subject}"`);
           checkpoint[msgKey] = 'done';
           stats.skipped++;
+          processedCount++;
           continue;
         }
 
         if (this.config.dry_run) {
           this.logger.info(`[DRY RUN] Would migrate: ${msg.subject}`);
           stats.migrated++;
+          processedCount++;
           continue;
         }
 
         try {
-          await this._createMessage(srcEmail, tgtEmail, tgtFolderId, msg);
+          await this._createMessage(tgtEmail, tgtFolderId, msg);
           if (msg.internetMessageId) targetIndex.add(msg.internetMessageId);
           checkpoint[msgKey] = 'done';
           stats.migrated++;
+          processedCount++;
+          
+          // Progress indicator every 10 messages or at specific milestones
+          if (processedCount % 10 === 0 && expectedCount > 0) {
+            const percentage = Math.min(100, Math.round((processedCount / expectedCount) * 100));
+            this.logger.info(`   ⏳ Progress: ${processedCount}/${expectedCount} (${percentage}%) | ✓ ${stats.migrated} migrated, ⏭ ${stats.skipped} skipped, ✗ ${stats.failed} failed`);
+          }
         } catch (err) {
           this.logger.error(`Failed to migrate message "${msg.subject}": ${err.message}`);
           stats.failed++;
+          processedCount++;
         }
       }
 
@@ -254,22 +271,9 @@ class EmailMigrator {
     return stats;
   }
 
-  async _createMessage(srcEmail, tgtEmail, folderId, msg) {
-    // Prefer MIME copy to preserve original transport headers (Date, Message-ID, etc.)
-    try {
-      const mimeContent = await this.src.getRaw(
-        `/users/${srcEmail}/messages/${msg.id}/$value`,
-        { Accept: 'message/rfc822' }
-      );
-
-      return await this.tgt.postRaw(
-        `/users/${tgtEmail}/mailFolders/${folderId}/messages`,
-        mimeContent,
-        { 'Content-Type': 'message/rfc822' }
-      );
-    } catch (err) {
-      this.logger.warn(`MIME copy failed for "${msg.subject}"; falling back to JSON mode: ${err.message}`);
-    }
+  async _createMessage(userEmail, folderId, msg) {
+    // Use the original received date, fall back to sent date
+    const originalDate = msg.receivedDateTime || msg.sentDateTime;
 
     const payload = {
       subject: msg.subject || '(sem assunto)',
@@ -280,25 +284,26 @@ class EmailMigrator {
       bccRecipients: msg.bccRecipients || [],
       replyTo:       msg.replyTo       || [],
       receivedDateTime: msg.receivedDateTime,
+      sentDateTime: msg.sentDateTime,
       isRead:    msg.isRead,
       flag:      msg.flag,
       importance: msg.importance || 'normal',
-      // Graph API: only x- prefixed, no duplicates, max 5
-      internetMessageHeaders: Object.values(
-        (msg.internetMessageHeaders || [])
-          .filter(h => h.name && h.name.toLowerCase().startsWith('x-'))
-          .reduce((acc, h) => { acc[h.name.toLowerCase()] = h; return acc; }, {})
-      ).slice(0, 5)
+      // singleValueExtendedProperties pins the displayed date in Outlook
+      // PR_MESSAGE_DELIVERY_TIME (0x0E06) = the timestamp shown in the inbox list
+      singleValueExtendedProperties: originalDate ? [
+        { id: `SystemTime 0x0E06`, value: originalDate },
+        { id: `SystemTime 0x0039`, value: msg.sentDateTime || originalDate }
+      ] : []
     };
 
     const created = await this.tgt.post(
-      `/users/${tgtEmail}/mailFolders/${folderId}/messages`,
+      `/users/${userEmail}/mailFolders/${folderId}/messages`,
       payload
     );
 
     if (!msg.isDraft) {
       await this.tgt.patch(
-        `/users/${tgtEmail}/messages/${created.id}`,
+        `/users/${userEmail}/messages/${created.id}`,
         { isDraft: false }
       );
     }

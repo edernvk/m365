@@ -1,8 +1,21 @@
 const fs = require('fs');
+const path = require('path');
 
 class CheckpointManager {
   constructor(checkpointFile) {
-    this.file = checkpointFile;
+    // Ensure we have a file path, not a directory
+    if (fs.existsSync(checkpointFile) && fs.statSync(checkpointFile).isDirectory()) {
+      this.file = path.join(checkpointFile, 'resume.json');
+    } else {
+      this.file = checkpointFile;
+    }
+    
+    // Ensure parent directory exists
+    const dir = path.dirname(this.file);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    
     this.data = this._load();
   }
 

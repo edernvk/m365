@@ -44,11 +44,35 @@ class GraphClient {
       }
 
       if (response.status >= 400) {
-        const errMsg = response.data?.error?.message || JSON.stringify(response.data);
+        let errMsg;
+        if (response.data) {
+          if (typeof response.data === 'string') {
+            try {
+              const parsed = JSON.parse(response.data);
+              errMsg = parsed?.error?.message || response.data;
+            } catch (e) {
+              errMsg = response.data;
+            }
+          } else {
+            errMsg = response.data?.error?.message || JSON.stringify(response.data);
+          }
+        } else {
+          errMsg = `HTTP ${response.status} with no error message`;
+        }
         throw new Error(`HTTP ${response.status}: ${errMsg}`);
       }
 
       await this._sleep(this.throttleDelay);
+
+      // For calls that expect text, try to parse as JSON for convenience of callers
+      if (responseType === 'text' && typeof response.data === 'string') {
+        try {
+          return JSON.parse(response.data);
+        } catch (e) {
+          // Not JSON, return as is
+          return response.data;
+        }
+      }
       return response.data;
 
     } catch (err) {
@@ -78,7 +102,7 @@ class GraphClient {
   }
 
   async postRaw(url, data, extraHeaders = {}) {
-    return this.request('POST', url, data, extraHeaders, 1, 'json');
+    return this.request('POST', url, data, extraHeaders, 1, 'text');
   }
 
   async put(url, data, extraHeaders = {}) {
