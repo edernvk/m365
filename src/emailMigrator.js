@@ -44,7 +44,7 @@ class EmailMigrator {
       this.logger.info(`Found ${folders.length} folders`);
 
       // 2. Pre-scan: count messages and size per folder
-      this.logger.info('Scanning mailbox size (this may take a moment)...');
+      this.logger.info('📊 Scanning mailbox...');
       let totalMessages = 0;
       let totalBytes = 0;
       const folderSizes = {};
@@ -56,44 +56,70 @@ class EmailMigrator {
             { '$select': 'id,displayName,totalItemCount,sizeInBytes' }
           );
           const count = detail.totalItemCount || 0;
-          const bytes = detail.sizeInBytes || 0;
-          folderSizes[folder.id] = { count, bytes };
+          let bytes = detail.sizeInBytes || 0;
+          
+          // FALLBACK: Se sizeInBytes = 0 mas tem mensagens, estima ~150KB/msg
+          if (bytes === 0 && count > 0) {
+            bytes = count * 150 * 1024; // 150KB por mensagem (estimativa)
+          }
+          
+          folderSizes[folder.id] = { count, bytes, estimated: detail.sizeInBytes === 0 };
           totalMessages += count;
           totalBytes += bytes;
         } catch (e) {
-          folderSizes[folder.id] = { count: 0, bytes: 0 };
+          folderSizes[folder.id] = { count: 0, bytes: 0, estimated: false };
         }
       }
 
       stats.messages_total = totalMessages;
       stats.bytes_total = totalBytes;
 
+      const hasEstimates = Object.values(folderSizes).some(f => f.estimated);
       this.logger.info(
-        `📊 Mailbox scan complete: ${totalMessages.toLocaleString()} messages | ${this._formatBytes(totalBytes)} total`
+        `📊 Scan complete: ${totalMessages.toLocaleString()} messages | ${this._formatBytes(totalBytes)}${hasEstimates ? ' (estimated)' : ''}`
       );
+      
+      // Estimativa de tempo (considerando velocidade otimizada: ~700 msgs/min)
+      if (totalMessages > 0) {
+        const estimatedMinutes = Math.ceil(totalMessages / 700);
+        const hours = Math.floor(estimatedMinutes / 60);
+        const mins = estimatedMinutes % 60;
+        const timeStr = hours > 0 ? `${hours}h ${mins}min` : `${mins}min`;
+        this.logger.info(`⏱️  Estimated time: ~${timeStr} (at ~700 msgs/min)`);
+      }
 
       for (const folder of folders) {
         const sz = folderSizes[folder.id];
         if (sz && sz.count > 0) {
+          const sizeStr = sz.estimated ? `~${this._formatBytes(sz.bytes)}` : this._formatBytes(sz.bytes);
           this.logger.info(
-            `   📁 ${folder.displayName.padEnd(30)} ${String(sz.count).padStart(6)} msgs | ${this._formatBytes(sz.bytes)}`
+            `   📁 ${folder.displayName.padEnd(30)} ${String(sz.count).padStart(6)} msgs | ${sizeStr}`
           );
         }
       }
 
       // 3. Migrate folder by folder
+      const startTime = Date.now();
+      let processedMessages = 0;
+      
       for (const folder of folders) {
         const folderKey = `email_folder_${folder.id}`;
 
         if (checkpoint[folderKey] === 'done') {
           this.logger.info(`⏭  Skipping (already migrated): ${folder.displayName}`);
           stats.folders_done++;
+          const sz = folderSizes[folder.id] || { count: 0 };
+          processedMessages += sz.count;
           continue;
         }
 
         const sz = folderSizes[folder.id] || { count: 0, bytes: 0 };
+        const sizeStr = sz.estimated ? `~${this._formatBytes(sz.bytes)}` : this._formatBytes(sz.bytes);
+        
+        // Progresso global
+        const globalProgress = totalMessages > 0 ? Math.round((processedMessages / totalMessages) * 100) : 0;
         this.logger.info(
-          `📂 Migrating [${stats.folders_done + 1}/${folders.length}]: ${folder.displayName} (${sz.count} msgs / ${this._formatBytes(sz.bytes)})`
+          `\n📂 [${stats.folders_done + 1}/${folders.length}] ${folder.displayName} (${sz.count} msgs / ${sizeStr}) | Global: ${globalProgress}%`
         );
 
         const targetFolderId = await this._ensureFolder(targetEmail, folder.displayName);
@@ -113,8 +139,19 @@ class EmailMigrator {
         stats.messages_skipped  += folderStats.skipped;
         stats.messages_failed   += folderStats.failed;
         stats.folders_done++;
+        processedMessages += sz.count;
 
         checkpoint[folderKey] = 'done';
+        
+        // Velocidade atual e tempo restante
+        const elapsedMinutes = (Date.now() - startTime) / 60000;
+        const currentSpeed = processedMessages / elapsedMinutes;
+        const remainingMessages = totalMessages - processedMessages;
+        const remainingMinutes = currentSpeed > 0 ? Math.ceil(remainingMessages / currentSpeed) : 0;
+        
+        this.logger.info(
+          `✅ Folder complete | Speed: ${Math.round(currentSpeed)} msgs/min | ETA: ${remainingMinutes}min remaining`
+        );
         
         // Save checkpoint after each folder
         if (this.checkpointManager) {
