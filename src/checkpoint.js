@@ -30,6 +30,11 @@ class CheckpointManager {
     return {};
   }
 
+  // Método load() público para compatibilidade com migrator.js
+  load() {
+    return this.data;
+  }
+
   save() {
     fs.writeFileSync(this.file, JSON.stringify(this.data, null, 2));
   }

@@ -5,7 +5,8 @@ const OneDriveMigrator = require('./onedriveMigrator');
 const CalendarMigrator = require('./calendarMigrator');
 const CheckpointManager = require('./checkpoint');
 const Logger = require('./logger');
-const GraphAuth = require('./auth');
+const TenantAuth = require('./auth');
+const GraphClient = require('./graphClient');
 
 async function main() {
   const logger = new Logger('main');
@@ -43,28 +44,22 @@ async function main() {
     
     logger.info(`Loaded ${users.length} user(s) for migration`);
     
-    // Authenticate to source and target
+    // Authenticate to source and target (CORRIGIDO!)
     logger.info('Authenticating to source tenant...');
-    const sourceAuth = new GraphAuth(
-      config.source_tenant.tenant_id,
-      config.source_tenant.client_id,
-      config.source_tenant.client_secret
-    );
-    await sourceAuth.authenticate();
+    const sourceAuth = new TenantAuth(config.source_tenant, 'source');
+    await sourceAuth.getToken();
+    const sourceClient = new GraphClient(sourceAuth, config.migration, logger);
     logger.success('Source tenant authenticated ✓');
     
     logger.info('Authenticating to target tenant...');
-    const targetAuth = new GraphAuth(
-      config.target_tenant.tenant_id,
-      config.target_tenant.client_id,
-      config.target_tenant.client_secret
-    );
-    await targetAuth.authenticate();
+    const targetAuth = new TenantAuth(config.target_tenant, 'target');
+    await targetAuth.getToken();
+    const targetClient = new GraphClient(targetAuth, config.migration, logger);
     logger.success('Target tenant authenticated ✓');
     
     // Migrate users
     for (const user of users) {
-      const userLogger = new Logger(user.sourceEmail.replace('@', '_'));
+      const userLogger = new Logger(user.sourceEmail.replace('@', '_').replace(/\./g, '_'));
       
       try {
         // Email migration
@@ -84,9 +79,9 @@ async function main() {
             userLogger.info(`Starting email migration: ${user.sourceEmail} → ${user.targetEmail}`);
             
             const emailMigrator = new EmailMigrator(
-              sourceAuth,
-              targetAuth,
-              { ...config.migration, sync: syncMode },  // Pass sync flag
+              sourceClient,
+              targetClient,
+              { ...config.migration, sync: syncMode },
               userLogger,
               checkpointManager
             );
@@ -110,8 +105,8 @@ async function main() {
           userLogger.info(`Starting OneDrive for ${user.sourceEmail}`);
           
           const onedriveMigrator = new OneDriveMigrator(
-            sourceAuth,
-            targetAuth,
+            sourceClient,
+            targetClient,
             config.migration,
             userLogger,
             checkpointManager
@@ -135,8 +130,8 @@ async function main() {
           userLogger.info(`Starting calendar for ${user.sourceEmail}`);
           
           const calendarMigrator = new CalendarMigrator(
-            sourceAuth,
-            targetAuth,
+            sourceClient,
+            targetClient,
             config.migration,
             userLogger,
             checkpointManager
