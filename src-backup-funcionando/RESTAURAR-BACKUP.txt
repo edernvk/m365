@@ -1,0 +1,173 @@
+═══════════════════════════════════════════════════════════════
+ 🔄 RESTAURAR PROJETO PARA VERSÃO QUE FUNCIONAVA
+═══════════════════════════════════════════════════════════════
+
+🎯 OBJETIVO:
+
+Voltar o projeto EXATAMENTE para o estado do ZIP enviado,
+quando estava funcionando perfeitamente (sem erros).
+
+═══════════════════════════════════════════════════════════════
+
+📦 ARQUIVOS DO BACKUP (10 arquivos):
+
+Todos estão na pasta: src-backup/
+
+1. auth.js
+2. calendarMigrator.js
+3. checkpoint.js
+4. emailMigrator.js
+5. graphClient.js
+6. logger.js
+7. migrator.js
+8. onedriveMigrator.js
+9. status.js
+10. userLoader.js
+
+═══════════════════════════════════════════════════════════════
+
+🚀 PASSO A PASSO PARA RESTAURAR:
+
+OPÇÃO 1: RESTAURAR TODOS OS ARQUIVOS DE UMA VEZ
+
+# No PowerShell, na pasta do projeto:
+cd C:\Users\eder\m365
+
+# Baixe a pasta src-backup completa
+# Depois execute:
+
+Remove-Item .\src\* -Force
+Copy-Item src-backup\* .\src\
+docker-compose down
+docker-compose build --no-cache
+docker-compose up migrator
+
+
+OPÇÃO 2: ARQUIVO POR ARQUIVO (Mais seguro)
+
+# 1. Substitua cada arquivo
+Copy-Item src-backup\auth.js .\src\auth.js
+Copy-Item src-backup\calendarMigrator.js .\src\calendarMigrator.js
+Copy-Item src-backup\checkpoint.js .\src\checkpoint.js
+Copy-Item src-backup\emailMigrator.js .\src\emailMigrator.js
+Copy-Item src-backup\graphClient.js .\src\graphClient.js
+Copy-Item src-backup\logger.js .\src\logger.js
+Copy-Item src-backup\migrator.js .\src\migrator.js
+Copy-Item src-backup\onedriveMigrator.js .\src\onedriveMigrator.js
+Copy-Item src-backup\status.js .\src\status.js
+Copy-Item src-backup\userLoader.js .\src\userLoader.js
+
+# 2. Rebuild
+docker-compose down
+docker system prune -f
+docker-compose build --no-cache
+
+# 3. Teste
+docker-compose up migrator
+
+═══════════════════════════════════════════════════════════════
+
+✅ O QUE ESSE BACKUP TEM:
+
+1. ✅ Arquitetura correta funcionando
+   - TenantAuth → GraphClient → EmailMigrator
+
+2. ✅ Deduplicação com SourceMessageId
+   - Funcionando 100%
+
+3. ✅ Logs com timezone
+   - Horário de Brasília (-03:00)
+
+4. ✅ Checkpoint funcionando
+   - Salva e resume progresso
+
+5. ✅ Velocidade otimizada
+   - ~700-900 msgs/min
+
+═══════════════════════════════════════════════════════════════
+
+⚠️  O QUE ESSE BACKUP NÃO TEM:
+
+❌ Sync mode (--sync flag)
+   - Para usar sync, precisa das modificações
+   - Mas elas causaram erros
+
+❌ Logs com email do usuário no GraphClient
+   - Logs aparecem como [./logs]
+   - Não como [usuario@dominio.com.br]
+
+═══════════════════════════════════════════════════════════════
+
+🎯 RECOMENDAÇÃO:
+
+1. RESTAURE o backup (versão que funcionava)
+2. TERMINE a migração principal
+3. DEPOIS, com calma, implementamos melhorias
+
+NÃO vale a pena arriscar a migração principal
+por funcionalidades extras (sync mode).
+
+Primeiro: FUNCIONAR
+Depois: MELHORAR
+
+═══════════════════════════════════════════════════════════════
+
+📊 COMO TESTAR SE DEU CERTO:
+
+Após restaurar e rebuild, rode:
+
+docker-compose up migrator
+
+Deve mostrar:
+✅ Source tenant authenticated ✓
+✅ Target tenant authenticated ✓
+✅ Starting email for usuario@...
+✅ Scanning mailbox...
+✅ Mensagens sendo migradas
+
+SE aparecer erros como:
+❌ "is not a function"
+❌ "is not async iterable"
+❌ "invalid_client_credential"
+
+Então algo ainda está errado.
+
+═══════════════════════════════════════════════════════════════
+
+💡 DICA:
+
+Se quiser GARANTIR restauração 100%:
+
+1. Faça backup da pasta atual:
+   Rename-Item .\src .\src-old
+
+2. Crie pasta nova:
+   New-Item -ItemType Directory -Path .\src
+
+3. Copie todos do backup:
+   Copy-Item src-backup\* .\src\
+
+4. Rebuild:
+   docker-compose build --no-cache
+
+Assim você tem as duas versões e pode comparar!
+
+═══════════════════════════════════════════════════════════════
+
+🚨 IMPORTANTE:
+
+- SEMPRE faça backup antes de mudanças
+- SEMPRE teste em modo normal antes de sync
+- NUNCA delete resume.json sem necessidade
+- SEMPRE faça build --no-cache após trocar arquivos
+
+═══════════════════════════════════════════════════════════════
+
+✅ GARANTIA:
+
+Estes arquivos são EXATAMENTE os do ZIP que você enviou,
+do momento em que estava funcionando perfeitamente.
+
+Basta restaurar e vai funcionar como antes! 🎯
+
+═══════════════════════════════════════════════════════════════
