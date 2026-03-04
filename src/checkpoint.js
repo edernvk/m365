@@ -3,12 +3,7 @@ const path = require('path');
 
 class CheckpointManager {
   constructor(checkpointFile) {
-    // Ensure we have a file path, not a directory
-    if (fs.existsSync(checkpointFile) && fs.statSync(checkpointFile).isDirectory()) {
-      this.file = path.join(checkpointFile, 'resume.json');
-    } else {
-      this.file = checkpointFile;
-    }
+    this.file = checkpointFile;
     
     // Ensure parent directory exists
     const dir = path.dirname(this.file);
@@ -21,7 +16,12 @@ class CheckpointManager {
 
   _load() {
     if (fs.existsSync(this.file)) {
+      // Se for pasta, retorna vazio (não tenta apagar)
       try {
+        const stats = fs.statSync(this.file);
+        if (stats.isDirectory()) {
+          return {};
+        }
         return JSON.parse(fs.readFileSync(this.file, 'utf8'));
       } catch (e) {
         return {};
@@ -30,13 +30,21 @@ class CheckpointManager {
     return {};
   }
 
-  // Método load() público para compatibilidade com migrator.js
+  // Método load() público
   load() {
     return this.data;
   }
 
   save() {
-    fs.writeFileSync(this.file, JSON.stringify(this.data, null, 2));
+    try {
+      // Se resume.json é pasta, não salva
+      if (fs.existsSync(this.file) && fs.statSync(this.file).isDirectory()) {
+        return;
+      }
+      fs.writeFileSync(this.file, JSON.stringify(this.data, null, 2));
+    } catch (e) {
+      // Ignora erros de salvamento
+    }
   }
 
   getUserCheckpoint(userEmail, workload) {
