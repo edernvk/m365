@@ -11,21 +11,21 @@
 const MIGRATION_PROPERTY_ID = 'String {8ECCC264-6880-4EBE-992F-8888D2EEAA1D} Name SourceMessageId';
 
 class EmailMigrator {
-  constructor(sourceClient, targetClient, config, logger) {
+  constructor(sourceClient, targetClient, config, logger, checkpointManager = null) {
     this.src = sourceClient;
     this.tgt = targetClient;
     this.config = config;
     this.logger = logger;
+    this.checkpointManager = checkpointManager;
     this.pageSize = config.email_page_size || 100;
     
-    // Inject logger into GraphClients for detailed API logging
-    if (this.src && !this.src.logger) this.src.logger = logger;
-    if (this.tgt && !this.tgt.logger) this.tgt.logger = logger;
+    // FORÇA atualização do logger nos GraphClients para mostrar email do usuário
+    if (this.src) this.src.logger = logger;
+    if (this.tgt) this.tgt.logger = logger;
   }
 
-  async migrate(sourceEmail, targetEmail, checkpoint = {}, checkpointManager = null) {
+  async migrate(sourceEmail, targetEmail, checkpoint = {}) {
     this.logger.info(`Starting email migration: ${sourceEmail} → ${targetEmail}`);
-    this.checkpointManager = checkpointManager;
 
     const stats = {
       folders_total: 0,

@@ -69,27 +69,39 @@ async function main() {
       try {
         // Email migration
         if (workload === 'all' || workload === 'email') {
-          userLogger.info(`Starting email for ${user.sourceEmail}`);
-          userLogger.info(`Starting email migration: ${user.sourceEmail} → ${user.targetEmail}`);
+          const emailKey = `${user.sourceEmail}_email`;
           
-          const emailMigrator = new EmailMigrator(
-            sourceAuth,
-            targetAuth,
-            { ...config.migration, sync: syncMode },  // Pass sync flag
-            userLogger,
-            checkpointManager
-          );
-          
-          const result = await emailMigrator.migrate(
-            user.sourceEmail,
-            user.targetEmail,
-            checkpoint
-          );
-          
-          if (!result.success) {
-            userLogger.error(`Email migration failed: ${result.error}`);
+          // Sync mode: reprocess even if marked as done
+          if (checkpoint[emailKey] === 'done' && !syncMode) {
+            userLogger.info(`Skipping email (already completed)`);
           } else {
-            userLogger.success(`Email migration completed successfully`);
+            if (checkpoint[emailKey] === 'done' && syncMode) {
+              userLogger.info(`🔄 SYNC MODE: Re-processing ${user.sourceEmail} for new messages`);
+            } else {
+              userLogger.info(`Starting email for ${user.sourceEmail}`);
+            }
+            
+            userLogger.info(`Starting email migration: ${user.sourceEmail} → ${user.targetEmail}`);
+            
+            const emailMigrator = new EmailMigrator(
+              sourceAuth,
+              targetAuth,
+              { ...config.migration, sync: syncMode },  // Pass sync flag
+              userLogger,
+              checkpointManager
+            );
+            
+            const result = await emailMigrator.migrate(
+              user.sourceEmail,
+              user.targetEmail,
+              checkpoint
+            );
+            
+            if (!result.success) {
+              userLogger.error(`Email migration failed: ${result.error}`);
+            } else {
+              userLogger.success(`Email migration completed successfully`);
+            }
           }
         }
         
