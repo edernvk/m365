@@ -1,54 +1,76 @@
 const fs = require('fs');
 const path = require('path');
-const chalk = require('chalk');
 
 class Logger {
-  constructor(logsDir, userName = 'general') {
+  constructor(name = 'main', logsDir = './logs') {
+    this.name = name;
     this.logsDir = logsDir;
-    this.userName = userName;
-    this.logFile = path.join(logsDir, `${userName.replace(/@/g, '_')}.log`);
-    this.summaryFile = path.join(logsDir, 'summary.json');
-
+    
+    // Garante que a pasta de logs existe
     if (!fs.existsSync(logsDir)) {
       fs.mkdirSync(logsDir, { recursive: true });
     }
+    
+    this.logFile = path.join(logsDir, `${name}.log`);
   }
 
   _timestamp() {
-    return new Date().toISOString();
+    // Usa timezone local (America/Sao_Paulo via TZ env var)
+    const now = new Date();
+    
+    // Formata: YYYY-MM-DDTHH:mm:ss.sssZ mas com offset local
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    const hours = String(now.getHours()).padStart(2, '0');
+    const minutes = String(now.getMinutes()).padStart(2, '0');
+    const seconds = String(now.getSeconds()).padStart(2, '0');
+    const ms = String(now.getMilliseconds()).padStart(3, '0');
+    
+    // Calcula offset do timezone (-03:00 para Brasília)
+    const offset = -now.getTimezoneOffset();
+    const offsetHours = String(Math.floor(Math.abs(offset) / 60)).padStart(2, '0');
+    const offsetMinutes = String(Math.abs(offset) % 60).padStart(2, '0');
+    const offsetSign = offset >= 0 ? '+' : '-';
+    
+    return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}.${ms}${offsetSign}${offsetHours}:${offsetMinutes}`;
   }
 
-  _write(level, message, data = null) {
-    const entry = {
-      timestamp: this._timestamp(),
-      level,
-      user: this.userName,
-      message,
-      ...(data && { data })
-    };
-
-    const line = JSON.stringify(entry) + '\n';
-    fs.appendFileSync(this.logFile, line);
-
-    const color = { INFO: chalk.blue, SUCCESS: chalk.green, WARN: chalk.yellow, ERROR: chalk.red };
-    const prefix = `[${entry.timestamp}] [${level}] [${this.userName}]`;
-    console.log((color[level] || chalk.white)(prefix), message);
-    if (data && process.env.VERBOSE) console.log(chalk.gray(JSON.stringify(data, null, 2)));
-  }
-
-  info(msg, data) { this._write('INFO', msg, data); }
-  success(msg, data) { this._write('SUCCESS', msg, data); }
-  warn(msg, data) { this._write('WARN', msg, data); }
-  error(msg, data) { this._write('ERROR', msg, data); }
-
-  updateSummary(userEmail, workload, stats) {
-    let summary = {};
-    if (fs.existsSync(this.summaryFile)) {
-      summary = JSON.parse(fs.readFileSync(this.summaryFile, 'utf8'));
+  _log(level, message) {
+    const timestamp = this._timestamp();
+    const logMessage = `[${timestamp}] [${level}] [${this.name}] ${message}`;
+    
+    // Console
+    console.log(logMessage);
+    
+    // File
+    try {
+      fs.appendFileSync(this.logFile, logMessage + '\n');
+    } catch (err) {
+      console.error(`Failed to write to log file: ${err.message}`);
     }
-    if (!summary[userEmail]) summary[userEmail] = {};
-    summary[userEmail][workload] = { ...stats, updatedAt: this._timestamp() };
-    fs.writeFileSync(this.summaryFile, JSON.stringify(summary, null, 2));
+  }
+
+  info(message) {
+    this._log('INFO', message);
+  }
+
+  success(message) {
+    this._log('SUCCESS', message);
+  }
+
+  warn(message) {
+    this._log('WARN', message);
+  }
+
+  error(message) {
+    this._log('ERROR', message);
+  }
+
+  debug(message) {
+    if (process.env.VERBOSE === 'true') {
+      this._log('DEBUG', message);
+    }
   }
 }
 
