@@ -5,6 +5,7 @@ const OneDriveMigrator = require('./onedriveMigrator');
 const CalendarMigrator = require('./calendarMigrator');
 const CheckpointManager = require('./checkpoint');
 const Logger = require('./logger');
+const GraphAuth = require('./auth');
 
 async function main() {
   const logger = new Logger('main');
@@ -44,7 +45,6 @@ async function main() {
     
     // Authenticate to source and target
     logger.info('Authenticating to source tenant...');
-    const GraphAuth = require('./auth');
     const sourceAuth = new GraphAuth(
       config.source_tenant.tenant_id,
       config.source_tenant.client_id,
