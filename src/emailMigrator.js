@@ -316,8 +316,8 @@ class EmailMigrator {
       for (const msg of messages) {
         const msgKey = `email_msg_${msg.id}`;
 
-        // Skip 1: checkpoint
-        if (checkpoint[msgKey]) {
+        // Skip 1: checkpoint (MAS NÃO no sync mode - sync sempre verifica destino!)
+        if (checkpoint[msgKey] && !this.config.sync) {
           stats.skipped++;
           processedCount++;
           continue;
