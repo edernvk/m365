@@ -105,12 +105,18 @@ class EmailMigrator {
       for (const folder of folders) {
         const folderKey = `email_folder_${folder.id}`;
 
-        if (checkpoint[folderKey] === 'done') {
+        // Sync mode: reprocess all folders to catch new messages
+        // Normal mode: skip folders marked as done
+        if (checkpoint[folderKey] === 'done' && !this.config.sync) {
           this.logger.info(`⏭  Skipping (already migrated): ${folder.displayName}`);
           stats.folders_done++;
           const sz = folderSizes[folder.id] || { count: 0 };
           processedMessages += sz.count;
           continue;
+        }
+        
+        if (checkpoint[folderKey] === 'done' && this.config.sync) {
+          this.logger.info(`🔄 SYNC: Re-checking ${folder.displayName} for new messages...`);
         }
 
         const sz = folderSizes[folder.id] || { count: 0, bytes: 0 };
