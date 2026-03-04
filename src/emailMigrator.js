@@ -126,7 +126,7 @@ class EmailMigrator {
 
         // Build dedup index from target folder
         const targetIndex = await this._buildTargetIndex(targetEmail, targetFolderId, folder.displayName);
-        this.logger.info(`   ✅ Found ${targetIndex.size} previously migrated message(s) in this folder`);
+        this.logger.info(`   ✅ Found ${targetIndex.ids.size} previously migrated message(s) in this folder`);
 
         const folderStats = await this._migrateFolder(
           sourceEmail, folder.id,
@@ -177,6 +177,8 @@ class EmailMigrator {
 
   async _buildTargetIndex(userEmail, folderId, folderName = 'folder') {
     const ids = new Set();
+    const fallbackKeys = new Set(); // Para mensagens sem SourceMessageId
+    
     try {
       this.logger.info(`   🔍 Checking existing messages in "${folderName}"...`);
       
@@ -188,7 +190,7 @@ class EmailMigrator {
         `/users/${userEmail}/mailFolders/${folderId}/messages`,
         { 
           '$expand': expand,
-          '$select': 'id',
+          '$select': 'id,subject,receivedDateTime',
           '$top': 500 
         },
         'existing messages'
@@ -200,13 +202,23 @@ class EmailMigrator {
         if (sourceIdProp && sourceIdProp.value) {
           // Esta mensagem foi migrada - adiciona ID da FONTE ao índice
           ids.add(sourceIdProp.value);
+        } else {
+          // FALLBACK: Mensagem SEM SourceMessageId (criada antes da implementação)
+          // Cria chave baseada em subject + data para deduplicação
+          if (msg.subject && msg.receivedDateTime) {
+            const fallbackKey = `${msg.subject}|${msg.receivedDateTime}`;
+            fallbackKeys.add(fallbackKey);
+          }
         }
-        // Se não tem a propriedade, ignora (não foi migrada por esta ferramenta)
+      }
+      
+      if (fallbackKeys.size > 0) {
+        this.logger.info(`   ⚠️  Found ${fallbackKeys.size} message(s) without SourceMessageId (using fallback dedup)`);
       }
     } catch (e) {
       this.logger.warn(`Could not build target index for dedup: ${e.message}`);
     }
-    return ids;
+    return { ids, fallbackKeys };
   }
 
   async _getAllFolders(userEmail) {
@@ -298,8 +310,23 @@ class EmailMigrator {
           continue;
         }
 
-        // Skip 2: already in target (deduplicação via SourceMessageId)
-        if (targetIndex.has(msg.id)) {
+        // Skip 2: already in target (deduplicação via SourceMessageId OU fallback)
+        let isDuplicate = false;
+        
+        // Método 1: Verifica por SourceMessageId (preferencial)
+        if (targetIndex.ids.has(msg.id)) {
+          isDuplicate = true;
+        }
+        
+        // Método 2: FALLBACK - Verifica por subject+date (para mensagens antigas sem SourceMessageId)
+        if (!isDuplicate && targetIndex.fallbackKeys.size > 0) {
+          const fallbackKey = `${msg.subject}|${msg.receivedDateTime}`;
+          if (targetIndex.fallbackKeys.has(fallbackKey)) {
+            isDuplicate = true;
+          }
+        }
+        
+        if (isDuplicate) {
           checkpoint[msgKey] = 'done';
           stats.skipped++;
           processedCount++;
