@@ -126,7 +126,18 @@ class EmailMigrator {
 
         // Build dedup index from target folder
         const targetIndex = await this._buildTargetIndex(targetEmail, targetFolderId, folder.displayName);
-        this.logger.info(`   ✅ Found ${targetIndex.ids.size} previously migrated message(s) in this folder`);
+        const totalProtected = targetIndex.ids.size + targetIndex.fallbackKeys.size;
+        if (totalProtected > 0) {
+          this.logger.info(`   ✅ Found ${totalProtected} existing message(s) - will skip duplicates`);
+          if (targetIndex.ids.size > 0) {
+            this.logger.info(`      └─ ${targetIndex.ids.size} with SourceMessageId (exact match)`);
+          }
+          if (targetIndex.fallbackKeys.size > 0) {
+            this.logger.info(`      └─ ${targetIndex.fallbackKeys.size} without SourceMessageId (fallback: subject+date)`);
+          }
+        } else {
+          this.logger.info(`   ✅ No existing messages found - starting fresh`);
+        }
 
         const folderStats = await this._migrateFolder(
           sourceEmail, folder.id,
@@ -210,10 +221,6 @@ class EmailMigrator {
             fallbackKeys.add(fallbackKey);
           }
         }
-      }
-      
-      if (fallbackKeys.size > 0) {
-        this.logger.info(`   ⚠️  Found ${fallbackKeys.size} message(s) without SourceMessageId (using fallback dedup)`);
       }
     } catch (e) {
       this.logger.warn(`Could not build target index for dedup: ${e.message}`);
@@ -344,8 +351,14 @@ class EmailMigrator {
         try {
           await this._createMessage(tgtEmail, tgtFolderId, msg);
           
-          // Adiciona ID FONTE ao índice após criar
-          targetIndex.add(msg.id);
+          // Adiciona ID FONTE ao índice após criar (para deduplicação futura)
+          targetIndex.ids.add(msg.id);
+          
+          // Também adiciona ao fallback index
+          if (msg.subject && msg.receivedDateTime) {
+            const fallbackKey = `${msg.subject}|${msg.receivedDateTime}`;
+            targetIndex.fallbackKeys.add(fallbackKey);
+          }
           
           checkpoint[msgKey] = 'done';
           stats.migrated++;
