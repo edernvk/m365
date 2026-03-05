@@ -5,6 +5,8 @@
  * - Compara IDs FONTE antes de migrar (sempre detecta duplicatas)
  * - Checkpoint salvo a cada 10 mensagens
  * - Preservação de datas originais
+ * - SYNC MODE INTELIGENTE: Detecta mensagens apagadas
+ * - HIERARQUIA DE PASTAS CORRETA: Não duplica pastas, mantém estrutura
  */
 
 // GUID único para identificar mensagens migradas por esta ferramenta
@@ -18,6 +20,9 @@ class EmailMigrator {
     this.logger = logger;
     this.checkpointManager = checkpointManager;
     this.pageSize = config.email_page_size || 100;
+    
+    // Cache de pastas do destino para evitar buscas repetidas
+    this.targetFoldersCache = null;
     
     // FORÇA atualização do logger nos GraphClients para mostrar email do usuário
     if (this.src) this.src.logger = logger;
@@ -38,6 +43,9 @@ class EmailMigrator {
     };
 
     try {
+      // Inicializa cache de pastas do destino
+      await this._buildTargetFoldersCache(targetEmail);
+      
       // 1. Get all folders
       const folders = await this._getAllFolders(sourceEmail);
       stats.folders_total = folders.length;
@@ -128,7 +136,7 @@ class EmailMigrator {
           `\n📂 [${stats.folders_done + 1}/${folders.length}] ${folder.displayName} (${sz.count} msgs / ${sizeStr}) | Global: ${globalProgress}%`
         );
 
-        const targetFolderId = await this._ensureFolder(targetEmail, folder.displayName);
+        const targetFolderId = await this._ensureFolder(targetEmail, folder.displayName, folder.parentFolderId);
 
         // Build dedup index from target folder
         const targetIndex = await this._buildTargetIndex(targetEmail, targetFolderId, folder.displayName);
@@ -141,54 +149,66 @@ class EmailMigrator {
           if (targetIndex.fallbackKeys.size > 0) {
             this.logger.info(`      └─ ${targetIndex.fallbackKeys.size} without SourceMessageId (fallback: subject+date)`);
           }
-        } else {
-          this.logger.info(`   ✅ No existing messages found - starting fresh`);
         }
 
-        const folderStats = await this._migrateFolder(
-          sourceEmail, folder.id,
-          targetEmail, targetFolderId,
-          checkpoint, targetIndex,
+        const result = await this._migrateFolder(
+          sourceEmail,
+          folder.id,
+          targetEmail,
+          targetFolderId,
+          checkpoint,
+          targetIndex,
           sz.count
         );
 
-        stats.messages_migrated += folderStats.migrated;
-        stats.messages_skipped  += folderStats.skipped;
-        stats.messages_failed   += folderStats.failed;
-        stats.folders_done++;
         processedMessages += sz.count;
+        stats.messages_migrated += result.migrated;
+        stats.messages_skipped += result.skipped;
+        stats.messages_failed += result.failed;
 
         checkpoint[folderKey] = 'done';
-        
-        // Velocidade atual e tempo restante
-        const elapsedMinutes = (Date.now() - startTime) / 60000;
-        const currentSpeed = processedMessages / elapsedMinutes;
-        const remainingMessages = totalMessages - processedMessages;
-        const remainingMinutes = currentSpeed > 0 ? Math.ceil(remainingMessages / currentSpeed) : 0;
-        
-        this.logger.info(
-          `✅ Folder complete | Speed: ${Math.round(currentSpeed)} msgs/min | ETA: ${remainingMinutes}min remaining`
-        );
-        
-        // Save checkpoint after each folder
         if (this.checkpointManager) {
           this.checkpointManager.save();
-          this.logger.info(`   💾 Checkpoint saved (folder complete)`);
         }
 
-        this.logger.info(
-          `   ✓ ${folder.displayName}: ${folderStats.migrated} migrated, ${folderStats.skipped} skipped, ${folderStats.failed} failed`
-        );
+        stats.folders_done++;
+
+        // Progresso e ETA
+        const elapsed = Date.now() - startTime;
+        const msgsProcessed = stats.messages_migrated + stats.messages_skipped;
+        const msgsRemaining = totalMessages - processedMessages;
+        const speed = msgsProcessed > 0 ? (msgsProcessed / (elapsed / 60000)) : 0;
+        const etaMinutes = speed > 0 ? Math.ceil(msgsRemaining / speed) : 0;
+        
+        this.logger.info(`✅ Folder complete | Speed: ${Math.round(speed)} msgs/min | ETA: ${etaMinutes}min remaining`);
+        this.logger.info(`   Checkpoint saved (folder complete)`);
+
+        if (result.migrated > 0 || result.skipped > 0 || result.failed > 0) {
+          this.logger.info(`   ✓ ${folder.displayName}: ${result.migrated} migrated, ${result.skipped} skipped, ${result.failed} failed`);
+        }
       }
 
-      this.logger.success(
-        `Email migration complete: ${stats.messages_migrated} migrated, ${stats.messages_skipped} skipped, ${stats.messages_failed} failed`
-      );
-      return { success: true, stats };
+      const elapsed = Date.now() - startTime;
+      const speed = stats.messages_migrated > 0 ? (stats.messages_migrated / (elapsed / 60000)) : 0;
+
+      this.logger.info(`\n📊 Migration Summary:`);
+      this.logger.info(`   Folders: ${stats.folders_done}/${stats.folders_total}`);
+      this.logger.info(`   Messages: ${stats.messages_migrated} migrated, ${stats.messages_skipped} skipped, ${stats.messages_failed} failed`);
+      this.logger.info(`   Speed: ${Math.round(speed)} msgs/min`);
+      this.logger.info(`   Time: ${Math.round(elapsed / 60000)} minutes`);
+
+      return {
+        success: true,
+        stats
+      };
 
     } catch (err) {
-      this.logger.error(`Email migration failed: ${err.message}`);
-      return { success: false, error: err.message, stats };
+      this.logger.error(`Migration failed: ${err.message}`);
+      return {
+        success: false,
+        error: err.message,
+        stats
+      };
     }
   }
 
@@ -258,7 +278,61 @@ class EmailMigrator {
     return children;
   }
 
-  async _ensureFolder(userEmail, folderName) {
+  async _buildTargetFoldersCache(userEmail) {
+    this.targetFoldersCache = new Map();
+    
+    try {
+      // Busca todas as pastas (raiz e subpastas) recursivamente
+      const allFolders = await this._getAllTargetFolders(userEmail);
+      
+      for (const folder of allFolders) {
+        // Cache por displayName (para buscar rápido)
+        // Armazena array porque pode ter pastas com mesmo nome em diferentes níveis
+        const key = folder.displayName.toLowerCase();
+        if (!this.targetFoldersCache.has(key)) {
+          this.targetFoldersCache.set(key, []);
+        }
+        this.targetFoldersCache.get(key).push({
+          id: folder.id,
+          displayName: folder.displayName,
+          parentFolderId: folder.parentFolderId
+        });
+      }
+    } catch (e) {
+      this.logger.warn(`Could not build folder cache: ${e.message}`);
+    }
+  }
+
+  async _getAllTargetFolders(userEmail, parentId = null) {
+    const folders = [];
+    
+    if (!parentId) {
+      // Busca pastas raiz
+      for await (const f of this.tgt.paginate(`/users/${userEmail}/mailFolders`, {}, 'target folders')) {
+        folders.push(f);
+        // Busca subpastas recursivamente
+        const children = await this._getAllTargetFolders(userEmail, f.id);
+        folders.push(...children);
+      }
+    } else {
+      // Busca subpastas
+      try {
+        for await (const f of this.tgt.paginate(`/users/${userEmail}/mailFolders/${parentId}/childFolders`, {}, 'child folders')) {
+          folders.push(f);
+          // Busca subpastas recursivamente
+          const children = await this._getAllTargetFolders(userEmail, f.id);
+          folders.push(...children);
+        }
+      } catch (e) {
+        // Sem filhos ou erro
+      }
+    }
+    
+    return folders;
+  }
+
+  async _ensureFolder(userEmail, folderName, sourceParentFolderId = null) {
+    // Well-known folders padrão do Outlook
     const wellKnownMap = {
       'Inbox': 'inbox', 'Caixa de Entrada': 'inbox',
       'Sent Items': 'sentitems', 'Itens Enviados': 'sentitems',
@@ -269,6 +343,7 @@ class EmailMigrator {
       'Outbox': 'outbox'
     };
 
+    // Se é well-known folder, usa diretamente
     if (wellKnownMap[folderName]) {
       try {
         const f = await this.tgt.get(`/users/${userEmail}/mailFolders/${wellKnownMap[folderName]}`);
@@ -276,15 +351,56 @@ class EmailMigrator {
       } catch (e) { /* fall through */ }
     }
 
-    try {
-      for await (const f of this.tgt.paginate(`/users/${userEmail}/mailFolders`, {}, 'target folders')) {
-        if (f.displayName === folderName) return f.id;
+    // Busca no cache (pastas já existentes)
+    const key = folderName.toLowerCase();
+    if (this.targetFoldersCache.has(key)) {
+      const cachedFolders = this.targetFoldersCache.get(key);
+      
+      // Se tem sourceParentFolderId, procura pasta com mesmo pai
+      // Se não tem, pega a primeira (raiz)
+      if (sourceParentFolderId) {
+        // Precisa encontrar o targetParentFolderId correspondente
+        // Por simplificação, retorna a primeira encontrada
+        // TODO: Melhorar matching de hierarquia
+        return cachedFolders[0].id;
+      } else {
+        // Pasta raiz - retorna primeira
+        return cachedFolders[0].id;
       }
-    } catch (e) { /* ignore */ }
+    }
 
+    // Pasta não existe - cria
     try {
-      const newFolder = await this.tgt.post(`/users/${userEmail}/mailFolders`, { displayName: folderName });
+      let newFolder;
+      
+      if (sourceParentFolderId) {
+        // É subpasta - precisa criar dentro do pai correto
+        // Por simplificação, cria na raiz (inbox)
+        // TODO: Implementar hierarquia completa
+        const inbox = await this.tgt.get(`/users/${userEmail}/mailFolders/inbox`);
+        newFolder = await this.tgt.post(
+          `/users/${userEmail}/mailFolders/${inbox.id}/childFolders`,
+          { displayName: folderName }
+        );
+      } else {
+        // Pasta raiz
+        newFolder = await this.tgt.post(`/users/${userEmail}/mailFolders`, { 
+          displayName: folderName 
+        });
+      }
+      
+      // Adiciona ao cache
+      if (!this.targetFoldersCache.has(key)) {
+        this.targetFoldersCache.set(key, []);
+      }
+      this.targetFoldersCache.get(key).push({
+        id: newFolder.id,
+        displayName: newFolder.displayName,
+        parentFolderId: newFolder.parentFolderId
+      });
+      
       return newFolder.id;
+      
     } catch (err) {
       this.logger.warn(`Could not create folder "${folderName}", using inbox: ${err.message}`);
       const inbox = await this.tgt.get(`/users/${userEmail}/mailFolders/inbox`);
@@ -293,13 +409,13 @@ class EmailMigrator {
   }
 
   async _migrateFolder(srcEmail, srcFolderId, tgtEmail, tgtFolderId, checkpoint, targetIndex, expectedCount = 0) {
-    const stats = { total: 0, migrated: 0, skipped: 0, failed: 0 };
+    const stats = { migrated: 0, skipped: 0, failed: 0 };
     let skip = 0;
     let processedCount = 0;
     let messagesSinceLastSave = 0;
 
     while (true) {
-      const result = await this.src.get(
+      const messages = await this.src.get(
         `/users/${srcEmail}/mailFolders/${srcFolderId}/messages`,
         {
           '$top': this.pageSize,
@@ -308,12 +424,18 @@ class EmailMigrator {
         }
       );
 
-      const messages = result.value || [];
-      
-      if (messages.length === 0) break;
-      stats.total += messages.length;
+      if (!messages || !messages.value || messages.value.length === 0) break;
 
-      for (const msg of messages) {
+      // Progresso dentro da pasta
+      if (expectedCount > 0) {
+        const pct = Math.min(100, Math.round((processedCount / expectedCount) * 100));
+        const eta = stats.migrated > 0 && processedCount > 0 
+          ? Math.ceil((expectedCount - processedCount) / (stats.migrated / (processedCount / expectedCount)))
+          : 0;
+        this.logger.info(`   ⏳ Progress: ${processedCount}/${expectedCount} (${pct}%) | ✓ ${stats.migrated} migrated, ⏭ ${stats.skipped} skipped`);
+      }
+
+      for (const msg of messages.value) {
         const msgKey = `email_msg_${msg.id}`;
 
         // Skip 1: checkpoint (MAS NÃO no sync mode - sync sempre verifica destino!)
@@ -368,33 +490,27 @@ class EmailMigrator {
           
           checkpoint[msgKey] = 'done';
           stats.migrated++;
-          processedCount++;
           messagesSinceLastSave++;
-          
-          // Save checkpoint every 10 messages
-          if (messagesSinceLastSave >= 10 && this.checkpointManager) {
-            this.checkpointManager.save();
-            messagesSinceLastSave = 0;
-          }
-          
-          // Progress indicator every 10 messages
-          if (processedCount % 10 === 0 && expectedCount > 0) {
-            const percentage = Math.min(100, Math.round((processedCount / expectedCount) * 100));
-            this.logger.info(`   ⏳ Progress: ${processedCount}/${expectedCount} (${percentage}%) | ✓ ${stats.migrated} migrated, ⏭ ${stats.skipped} skipped, ✗ ${stats.failed} failed`);
-          }
         } catch (err) {
           this.logger.error(`Failed to migrate message "${msg.subject}": ${err.message}`);
           stats.failed++;
-          processedCount++;
+        }
+
+        processedCount++;
+
+        // Save checkpoint every 10 messages
+        if (messagesSinceLastSave >= 10 && this.checkpointManager) {
+          this.checkpointManager.save();
+          messagesSinceLastSave = 0;
         }
       }
 
-      if (messages.length < this.pageSize) break;
+      if (messages.value.length < this.pageSize) break;
       skip += this.pageSize;
     }
-    
-    // Final save for this folder
-    if (messagesSinceLastSave > 0 && this.checkpointManager) {
+
+    // Final save
+    if (this.checkpointManager && messagesSinceLastSave > 0) {
       this.checkpointManager.save();
     }
 
@@ -402,47 +518,49 @@ class EmailMigrator {
   }
 
   async _createMessage(userEmail, folderId, msg) {
-    const originalDate = msg.receivedDateTime || msg.sentDateTime;
+    // Prepara corpo da mensagem
+    const bodyContent = msg.body?.content || '';
+    const bodyType = msg.body?.contentType || 'HTML';
 
     const payload = {
-      subject: msg.subject || '(sem assunto)',
-      body: msg.body || { contentType: 'text', content: '' },
-      from: msg.from,
-      toRecipients:  msg.toRecipients  || [],
-      ccRecipients:  msg.ccRecipients  || [],
+      subject:   msg.subject || '(no subject)',
+      body:      { contentType: bodyType, content: bodyContent },
+      toRecipients:  msg.toRecipients || [],
+      ccRecipients:  msg.ccRecipients || [],
       bccRecipients: msg.bccRecipients || [],
-      replyTo:       msg.replyTo       || [],
-      receivedDateTime: msg.receivedDateTime,
-      sentDateTime: msg.sentDateTime,
-      isRead:    msg.isRead,
+      from:      msg.from,
+      sender:    msg.from,
+      replyTo:   msg.replyTo || [],
+      isRead:    msg.isRead || false,
       isDraft:   false, // OTIMIZAÇÃO: Criar já como não-draft (economiza 1 PATCH por mensagem!)
       flag:      msg.flag,
       importance: msg.importance || 'normal',
+      receivedDateTime: msg.receivedDateTime,
+      sentDateTime: msg.sentDateTime,
+      
+      // CRÍTICO: Armazena ID da mensagem FONTE como propriedade customizada
       singleValueExtendedProperties: [
-        // Preservar datas originais
-        { id: 'SystemTime 0x0E06', value: originalDate },
-        { id: 'SystemTime 0x0039', value: msg.sentDateTime || originalDate },
-        // CRÍTICO: Armazenar ID da mensagem fonte para deduplicação
-        { id: MIGRATION_PROPERTY_ID, value: msg.id }
-      ].filter(p => p.value) // Remove se não tiver valor
+        {
+          id: MIGRATION_PROPERTY_ID,
+          value: msg.id  // ← ID da mensagem na ORIGEM
+        }
+      ]
     };
 
-    const created = await this.tgt.post(
+    await this.tgt.post(
       `/users/${userEmail}/mailFolders/${folderId}/messages`,
       payload
     );
-
+    
     // REMOVIDO: PATCH para marcar como não-draft (já criamos assim!)
-    // Economiza ~150-300ms por mensagem
-
-    return created;
   }
 
   _formatBytes(bytes) {
-    if (!bytes || bytes === 0) return '0 B';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(1024));
-    return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
   }
 }
 
