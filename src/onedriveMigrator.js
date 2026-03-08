@@ -1,250 +1,174 @@
-/**
- * OneDrive Migration Module
- * Migrates files and folders preserving structure and metadata
- */
+═══════════════════════════════════════════════════════════════
+ 📁 ONEDRIVE MIGRATOR - INSTALAÇÃO
+═══════════════════════════════════════════════════════════════
 
-const axios = require('axios');
+🎯 OBJETIVO:
 
-class OneDriveMigrator {
-  constructor(sourceClient, targetClient, config, logger) {
-    this.src = sourceClient;
-    this.tgt = targetClient;
-    this.config = config;
-    this.logger = logger;
-    this.pageSize = config.onedrive_page_size || 200;
-  }
+Adicionar migração de OneDrive SEM modificar nada do Email que está
+funcionando perfeitamente.
 
-  async migrate(sourceEmail, targetEmail, checkpoint = {}) {
-    this.logger.info(`Starting OneDrive migration: ${sourceEmail} → ${targetEmail}`);
+═══════════════════════════════════════════════════════════════
 
-    const stats = {
-      folders_created: 0,
-      files_total: 0,
-      files_migrated: 0,
-      files_skipped: 0,
-      files_failed: 0,
-      bytes_migrated: 0
-    };
+📦 ARQUIVO PARA SUBSTITUIR:
 
-    try {
-      // Get source drive root
-      const srcDrive = await this.src.get(`/users/${sourceEmail}/drive/root`);
-      this.logger.info(`Source OneDrive root: ${srcDrive.id}`);
+APENAS 1 arquivo:
+✅ onedriveMigrator-COMPLETO.js → src/onedriveMigrator.js
 
-      // Get target drive root
-      const tgtDrive = await this.tgt.get(`/users/${targetEmail}/drive/root`);
-      this.logger.info(`Target OneDrive root: ${tgtDrive.id}`);
+NÃO TOQUE em:
+❌ emailMigrator.js (deixe como está!)
+❌ migrator.js (não precisa modificar)
+❌ checkpoint.js (não precisa modificar)
 
-      // Migrate recursively from root
-      await this._migrateFolder(
-        sourceEmail, 'root', '/',
-        targetEmail, 'root',
-        checkpoint, stats
-      );
+═══════════════════════════════════════════════════════════════
 
-      this.logger.success(
-        `OneDrive migration complete: ${stats.files_migrated} files (${this._formatBytes(stats.bytes_migrated)}), ${stats.files_failed} failed`
-      );
+🚀 INSTALAÇÃO (2 Passos):
 
-      return { success: true, stats };
+PASSO 1: Substituir arquivo
+────────────────────────────────────────────
+Copy-Item onedriveMigrator-COMPLETO.js .\src\onedriveMigrator.js
 
-    } catch (err) {
-      this.logger.error(`OneDrive migration failed: ${err.message}`);
-      return { success: false, error: err.message, stats };
-    }
-  }
 
-  async _migrateFolder(srcEmail, srcFolderId, srcPath, tgtEmail, tgtFolderId, checkpoint, stats) {
-    // List children of this folder
-    const items = [];
-    for await (const item of this.src.paginate(
-      `/users/${srcEmail}/drive/items/${srcFolderId}/children`,
-      { '$top': this.pageSize }
-    )) {
-      items.push(item);
-    }
+PASSO 2: Rebuild
+────────────────────────────────────────────
+docker-compose down
+docker-compose build --no-cache
 
-    this.logger.info(`Processing folder: ${srcPath} (${items.length} items)`);
+═══════════════════════════════════════════════════════════════
 
-    for (const item of items) {
-      const itemPath = `${srcPath}/${item.name}`.replace('//', '/');
+✅ FUNCIONALIDADES DO ONEDRIVE:
 
-      if (item.folder) {
-        // Create folder in target
-        const folderKey = `drive_folder_${item.id}`;
-        let tgtSubFolderId;
+1. ✅ DEDUPLICAÇÃO INTELIGENTE
+   - Por path + name + size
+   - Não duplica arquivos existentes
+   - Cache de arquivos do destino
 
-        if (checkpoint[folderKey]) {
-          tgtSubFolderId = checkpoint[folderKey];
-        } else {
-          if (!this.config.dry_run) {
-            const newFolder = await this._ensureFolder(tgtEmail, tgtFolderId, item.name);
-            tgtSubFolderId = newFolder.id;
-            checkpoint[folderKey] = tgtSubFolderId;
-            stats.folders_created++;
-          } else {
-            tgtSubFolderId = `dry_run_${item.id}`;
-          }
-        }
+2. ✅ SYNC MODE
+   - Detecta arquivos novos
+   - Detecta arquivos apagados
+   - Re-migra se necessário
 
-        // Recurse into subfolder
-        await this._migrateFolder(
-          srcEmail, item.id, itemPath,
-          tgtEmail, tgtSubFolderId,
-          checkpoint, stats
-        );
+3. ✅ ESTRUTURA DE PASTAS
+   - Mantém hierarquia completa
+   - Não duplica pastas
+   - Cria apenas o necessário
 
-      } else if (item.file) {
-        const fileKey = `drive_file_${item.id}`;
+4. ✅ CHECKPOINT GRANULAR
+   - Salva progresso a cada 5 arquivos
+   - Resume de onde parou
+   - Compatível com CheckpointManager
 
-        if (checkpoint[fileKey] === 'done') {
-          stats.files_skipped++;
-          continue;
-        }
+5. ✅ UPLOAD OTIMIZADO
+   - Small files (<4MB): Upload direto
+   - Large files (>4MB): Chunks de 10MB
+   - Timeout configurado
+   - Retry automático
 
-        stats.files_total++;
+6. ✅ LOGS DETALHADOS
+   - Progresso em tempo real
+   - Speed (files/min)
+   - ETA (tempo restante)
+   - Tamanho de dados migrados
 
-        if (this.config.dry_run) {
-          this.logger.info(`[DRY RUN] Would migrate file: ${itemPath} (${this._formatBytes(item.size)})`);
-          stats.files_migrated++;
-          continue;
-        }
+═══════════════════════════════════════════════════════════════
 
-        try {
-          await this._migrateFile(srcEmail, item, tgtEmail, tgtFolderId, itemPath);
-          checkpoint[fileKey] = 'done';
-          stats.files_migrated++;
-          stats.bytes_migrated += item.size || 0;
-        } catch (err) {
-          this.logger.error(`Failed to migrate file "${itemPath}": ${err.message}`);
-          stats.files_failed++;
-        }
-      }
-    }
-  }
+📊 USO:
 
-  async _ensureFolder(userEmail, parentFolderId, folderName) {
-    try {
-      const result = await this.tgt.post(
-        `/users/${userEmail}/drive/items/${parentFolderId}/children`,
-        {
-          name: folderName,
-          folder: {},
-          '@microsoft.graph.conflictBehavior': 'rename'
-        }
-      );
-      return result;
-    } catch (err) {
-      // Folder might already exist
-      for await (const item of this.tgt.paginate(
-        `/users/${userEmail}/drive/items/${parentFolderId}/children`
-      )) {
-        if (item.name === folderName && item.folder) return item;
-      }
-      throw err;
-    }
-  }
+MIGRAR APENAS EMAIL (como antes):
+────────────────────────────────────────────
+docker-compose run --rm migrator node src/migrator.js --workload=email
 
-  async _migrateFile(srcEmail, srcItem, tgtEmail, tgtFolderId, itemPath) {
-    // Get download URL for the source file
-    const srcItemDetail = await this.src.get(
-      `/users/${srcEmail}/drive/items/${srcItem.id}`,
-      { '$select': 'id,name,size,@microsoft.graph.downloadUrl' }
-    );
 
-    const downloadUrl = srcItemDetail['@microsoft.graph.downloadUrl'];
-    if (!downloadUrl) {
-      throw new Error(`No download URL for file: ${itemPath}`);
-    }
+MIGRAR APENAS ONEDRIVE:
+────────────────────────────────────────────
+docker-compose run --rm migrator node src/migrator.js --workload=onedrive
 
-    const fileSize = srcItem.size || 0;
 
-    if (fileSize <= 4 * 1024 * 1024) {
-      // Small file: direct upload (< 4MB)
-      await this._uploadSmallFile(tgtEmail, tgtFolderId, srcItem.name, downloadUrl, fileSize);
-    } else {
-      // Large file: resumable upload session
-      await this._uploadLargeFile(tgtEmail, tgtFolderId, srcItem.name, downloadUrl, fileSize);
-    }
+MIGRAR TUDO (Email + OneDrive):
+────────────────────────────────────────────
+docker-compose up migrator
+# OU
+docker-compose run --rm migrator node src/migrator.js --workload=all
 
-    this.logger.info(`✓ ${itemPath} (${this._formatBytes(fileSize)})`);
-  }
 
-  async _uploadSmallFile(tgtEmail, tgtFolderId, fileName, downloadUrl, fileSize) {
-    // Download file content
-    const downloadResponse = await axios.get(downloadUrl, {
-      responseType: 'arraybuffer',
-      timeout: 60000
-    });
+SYNC MODE ONEDRIVE (apenas arquivos novos):
+────────────────────────────────────────────
+docker-compose run --rm migrator node src/migrator.js --workload=onedrive --sync
 
-    const fileBuffer = Buffer.from(downloadResponse.data);
+═══════════════════════════════════════════════════════════════
 
-    // Upload to target
-    const tgtHeaders = await this.tgt.auth.getHeaders();
-    await axios.put(
-      `https://graph.microsoft.com/v1.0/users/${tgtEmail}/drive/items/${tgtFolderId}:/${encodeURIComponent(fileName)}:/content`,
-      fileBuffer,
-      {
-        headers: {
-          ...tgtHeaders,
-          'Content-Type': 'application/octet-stream',
-          'Content-Length': fileBuffer.length
-        },
-        maxBodyLength: Infinity
-      }
-    );
-  }
+📈 EXEMPLO DE LOGS:
 
-  async _uploadLargeFile(tgtEmail, tgtFolderId, fileName, downloadUrl, fileSize) {
-    const tgtHeaders = await this.tgt.auth.getHeaders();
+Starting OneDrive migration: user@origem.com → user@destino.com
+📊 Building file index for deduplication...
+✅ Found 1,234 existing files in target - will skip duplicates
+📊 Scanning OneDrive...
+📊 Scan complete: 5,678 files | 234 folders | 12.4 GB
+⏱️  Estimated time: ~1h 54min (at ~50 files/min)
 
-    // Create upload session
-    const sessionResponse = await axios.post(
-      `https://graph.microsoft.com/v1.0/users/${tgtEmail}/drive/items/${tgtFolderId}:/${encodeURIComponent(fileName)}:/createUploadSession`,
-      {
-        item: {
-          '@microsoft.graph.conflictBehavior': 'rename',
-          name: fileName
-        }
-      },
-      { headers: tgtHeaders }
-    );
+📂 /Documents (45 items) | Global: 23%
+   ✓ Report_2024.pdf (2.3 MB) | Speed: 52 files/min | ETA: 89min
+   ✓ Proposal.docx (854.2 KB) | Speed: 53 files/min | ETA: 87min
 
-    const uploadUrl = sessionResponse.data.uploadUrl;
-    const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks
+📂 /Pictures (128 items) | Global: 67%
+   ✓ photo_001.jpg (4.1 MB) | Speed: 51 files/min | ETA: 34min
 
-    // Download and upload in chunks
-    let offset = 0;
-    while (offset < fileSize) {
-      const end = Math.min(offset + CHUNK_SIZE - 1, fileSize - 1);
+📊 OneDrive Migration Summary:
+   Files: 3,456 migrated, 2,222 skipped, 0 failed
+   Data: 8.7 GB
+   Folders: 180 created
+   Speed: 52 files/min
+   Time: 67 minutes
 
-      const chunkResponse = await axios.get(downloadUrl, {
-        headers: { Range: `bytes=${offset}-${end}` },
-        responseType: 'arraybuffer',
-        timeout: 120000
-      });
+═══════════════════════════════════════════════════════════════
 
-      const chunk = Buffer.from(chunkResponse.data);
+🔧 CONFIGURAÇÃO (config.json):
 
-      await axios.put(uploadUrl, chunk, {
-        headers: {
-          'Content-Length': chunk.length,
-          'Content-Range': `bytes ${offset}-${end}/${fileSize}`
-        },
-        maxBodyLength: Infinity,
-        validateStatus: s => s < 500
-      });
+Já está configurado! Mas se quiser ajustar:
 
-      offset += CHUNK_SIZE;
-    }
-  }
-
-  _formatBytes(bytes) {
-    if (!bytes) return '0 B';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(1024));
-    return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
-  }
+"migration": {
+  "workloads": ["email"],  ← Adicione "onedrive" aqui se quiser
+  "onedrive_page_size": 200,  ← Tamanho de página (opcional)
+  ...
 }
 
-module.exports = OneDriveMigrator;
+═══════════════════════════════════════════════════════════════
+
+⚠️  IMPORTANTE:
+
+1. ✅ NÃO modifica Email (totalmente independente)
+2. ✅ Usa mesmo CheckpointManager
+3. ✅ Usa mesmo sistema de autenticação
+4. ✅ Logs no mesmo formato
+5. ✅ Sync mode funciona igual
+
+═══════════════════════════════════════════════════════════════
+
+💡 DICAS:
+
+1. TESTE PRIMEIRO:
+   Migre um usuário com poucos arquivos primeiro
+
+2. SYNC PERIÓDICO:
+   Configure para rodar diariamente com --sync
+
+3. APENAS NOVOS:
+   Use --workload=onedrive --sync para copiar só novos
+
+4. INTERROMPER:
+   Ctrl+C a qualquer momento
+   Resume.json salva progresso
+
+═══════════════════════════════════════════════════════════════
+
+🚀 PRONTO!
+
+Agora você tem:
+✅ Email funcionando perfeitamente
+✅ OneDrive com deduplicação
+✅ Sync mode em ambos
+✅ Logs detalhados
+✅ Checkpoint compartilhado
+
+Simples e poderoso! 🎯
+
+═══════════════════════════════════════════════════════════════
