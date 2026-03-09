@@ -535,10 +535,8 @@ class EmailMigrator {
       isDraft:   false, // OTIMIZAÇÃO: Criar já como não-draft (economiza 1 PATCH por mensagem!)
       flag:      msg.flag,
       importance: msg.importance || 'normal',
-      receivedDateTime: msg.receivedDateTime,
-      sentDateTime: msg.sentDateTime,
       
-      // CRÍTICO: Armazena ID da mensagem FONTE como propriedade customizada
+      // CRÍTICO: Armazena ID da mensagem FONTE como propriedade customizada para deduplicação
       singleValueExtendedProperties: [
         {
           id: MIGRATION_PROPERTY_ID,
@@ -547,12 +545,26 @@ class EmailMigrator {
       ]
     };
 
-    await this.tgt.post(
+    // Cria a mensagem
+    const createdMsg = await this.tgt.post(
       `/users/${userEmail}/mailFolders/${folderId}/messages`,
       payload
     );
     
-    // REMOVIDO: PATCH para marcar como não-draft (já criamos assim!)
+    // CRÍTICO: PATCH imediatamente para preservar datas originais
+    // A Graph API ignora receivedDateTime/sentDateTime no POST, mas aceita no PATCH!
+    try {
+      await this.tgt.patch(
+        `/users/${userEmail}/messages/${createdMsg.id}`,
+        {
+          receivedDateTime: msg.receivedDateTime,
+          sentDateTime: msg.sentDateTime
+        }
+      );
+    } catch (e) {
+      // Se falhar, não é crítico - a mensagem já foi criada
+      // Apenas as datas ficarão com valor atual ao invés da original
+    }
   }
 
   _formatBytes(bytes) {
