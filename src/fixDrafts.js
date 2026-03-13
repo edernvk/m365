@@ -29,9 +29,9 @@ const DRY_RUN   = argv['dry-run'] || argv.d || false;
 const PAGE_SIZE = 100;
 
 // Conservative delays to avoid rate limiting
-const THROTTLE_MS    = 400;  // between individual API calls
-const PHASE_DELAY_MS = 3000; // between delete and create phases
-const CONCURRENCY    = 2;    // parallel per phase
+const THROTTLE_MS    = 150;  // between individual API calls
+const PHASE_DELAY_MS = 2000; // between delete and create phases
+const CONCURRENCY    = 3;    // parallel per phase
 
 const WELL_KNOWN = {
   'Caixa de Entrada': 'inbox',       'Inbox': 'inbox',
@@ -171,27 +171,41 @@ async function fixFolder(srcClient, tgtClient, srcEmail, tgtEmail, srcFolder, tg
     return;
   }
 
-  // ── PHASE 1: Fetch originals (concurrency 2) ────────────────────────────
-  logger.info(`   ⬇️  Phase 1/3: Fetching originals...`);
+  // ── PHASE 1: Fetch originals (concurrency 3) ────────────────────────────
+  logger.info(`   ⬇️  Phase 1/3: Fetching ${drafts.length} originals...`);
   const limit1 = pLimit(CONCURRENCY);
+  let fetchCount = 0;
   const enriched = await Promise.all(
     drafts.map(draft => limit1(async () => {
       const original = await fetchOriginal(srcClient, srcEmail, srcFolder.id, draft);
       await sleep(THROTTLE_MS);
+      fetchCount++;
+      if (fetchCount % 50 === 0 || fetchCount === drafts.length) {
+        const pct = Math.round((fetchCount / drafts.length) * 100);
+        const subj = (draft.subject || '').substring(0, 50);
+        logger.info(`   ⬇️  [${fetchCount}/${drafts.length}] ${pct}% — "${subj}"`);
+      }
       return { draft, original };
     }))
   );
   const foundCount = enriched.filter(e => e.original).length;
-  logger.info(`   ✓ ${foundCount} found in source, ${enriched.length - foundCount} will use draft copy`);
+  logger.info(`   ✓ Phase 1 done: ${foundCount} from source, ${enriched.length - foundCount} from draft copy`);
 
-  // ── PHASE 2: Delete all drafts (concurrency 2) ──────────────────────────
+  // ── PHASE 2: Delete all drafts (concurrency 3) ──────────────────────────
   logger.info(`   🗑️  Phase 2/3: Deleting ${drafts.length} drafts...`);
   const limit2 = pLimit(CONCURRENCY);
+  let delCount = 0;
   const deleteResults = await Promise.all(
     enriched.map(({ draft }) => limit2(async () => {
       try {
         await tgtClient.request('DELETE', `/users/${tgtEmail}/messages/${draft.id}`);
         await sleep(THROTTLE_MS);
+        delCount++;
+        if (delCount % 50 === 0 || delCount === drafts.length) {
+          const pct = Math.round((delCount / drafts.length) * 100);
+          const subj = (draft.subject || '').substring(0, 50);
+          logger.info(`   🗑️  [${delCount}/${drafts.length}] ${pct}% — "${subj}"`);
+        }
         return { id: draft.id, ok: true };
       } catch (e) {
         logger.warn(`   ⚠️  Delete failed "${draft.subject}": ${e.message}`);
@@ -200,7 +214,7 @@ async function fixFolder(srcClient, tgtClient, srcEmail, tgtEmail, srcFolder, tg
     }))
   );
   const deleted = deleteResults.filter(r => r.ok).map(r => r.id);
-  logger.info(`   ✓ ${deleted.length}/${drafts.length} deleted`);
+  logger.info(`   ✓ Phase 2 done: ${deleted.length}/${drafts.length} deleted`);
 
   // Wait for Exchange to settle
   logger.info(`   ⏳ Waiting ${PHASE_DELAY_MS/1000}s for Exchange to settle...`);
@@ -220,6 +234,7 @@ async function fixFolder(srcClient, tgtClient, srcEmail, tgtEmail, srcFolder, tg
   const toCreate   = enriched.filter(e => deletedSet.has(e.draft.id));
   const limit3     = pLimit(CONCURRENCY);
 
+  let createCount = 0;
   const createResults = await Promise.all(
     toCreate.map(({ draft, original }) => limit3(async () => {
       try {
@@ -231,6 +246,13 @@ async function fixFolder(srcClient, tgtClient, srcEmail, tgtEmail, srcFolder, tg
           payload
         );
         await sleep(THROTTLE_MS);
+        createCount++;
+        if (createCount % 50 === 0 || createCount === toCreate.length) {
+          const pct  = Math.round((createCount / toCreate.length) * 100);
+          const subj = (draft.subject || '').substring(0, 50);
+          const src  = original ? '✓src' : '~draft';
+          logger.info(`   ✉️  [${createCount}/${toCreate.length}] ${pct}% ${src} — "${subj}"`);
+        }
         return true;
       } catch (e) {
         logger.error(`   ✗ Create failed "${draft.subject}": ${e.message}`);
@@ -312,7 +334,7 @@ async function main() {
   await srcAuth.getToken();
   await tgtAuth.getToken();
 
-  const fixConfig = { ...config.migration, throttle_delay_ms: THROTTLE_MS };
+  const fixConfig = { ...config.migration, throttle_delay_ms: 100 }; // GraphClient internal throttle — low since we control delays explicitly above
   const srcClient = new GraphClient(srcAuth, fixConfig, mainLogger);
   const tgtClient = new GraphClient(tgtAuth, fixConfig, mainLogger);
   mainLogger.success('Both tenants authenticated ✓\n');
