@@ -421,12 +421,15 @@ class EmailMigrator {
         // Preservar datas originais
         { id: 'SystemTime 0x0E06', value: originalDate },
         { id: 'SystemTime 0x0039', value: msg.sentDateTime || originalDate },
-        // CRÍTICO: Remove flag de rascunho (PR_MESSAGE_FLAGS = sent+received, não draft)
-        // isDraft via PATCH é ignorado pela API — esta é a única forma correta
-        { id: 'Integer 0x0E07', value: '1' },
-        // CRÍTICO: Armazenar ID da mensagem fonte para deduplicação
+        // Remove flag de rascunho via MAPI properties (PATCH isDraft:false é ignorado pela API)
+        // 0x001A = message class, 0x0E07 = PR_MESSAGE_FLAGS (1=Read + 4=Submit = 5, sem Unsent/draft)
+        // 0x0E17 = PR_MESSAGE_STATE (1 = não draft)
+        { id: 'String 0x001A',  value: 'IPM.Note' },
+        { id: 'Integer 0x0E07', value: '5' },
+        { id: 'Integer 0x0E17', value: '1' },
+        // Armazenar ID da mensagem fonte para deduplicação
         { id: MIGRATION_PROPERTY_ID, value: msg.id }
-      ].filter(p => p.value) // Remove se não tiver valor
+      ].filter(p => p.value)
     };
 
     const created = await this.tgt.post(

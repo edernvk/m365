@@ -2,44 +2,44 @@
 /**
  * fixDrafts.js — Corrige mensagens migradas incorretamente como [Rascunho]
  *
- * COMO FUNCIONA:
- *   - Worker A: busca rascunhos no destino + coleta dados do original na origem → fila
- *   - Worker B: consome a fila em paralelo → DELETE rascunho + POST correto
- *   - A mensagem é criada com Integer 0x0E07 = 1 que remove o flag de rascunho
- *     diretamente no POST (PATCH isDraft:false é ignorado silenciosamente pela API)
+ * Execução 100% sequencial — sem concurrency para evitar rate limiting.
+ * Por pasta: Fase 1 (fetch) → Fase 2 (delete) → delay → Fase 3 (create)
  *
  * Usage:
- *   node src/fixDrafts.js                        # todos os usuários
- *   node src/fixDrafts.js --user email@domain    # só um usuário
- *   node src/fixDrafts.js --dry-run              # simulação
- *   node src/fixDrafts.js --concurrency 5        # paralelismo (default: 3)
+ *   node src/fixDrafts.js                      # todos os usuários
+ *   node src/fixDrafts.js --user email@domain  # só um usuário
+ *   node src/fixDrafts.js --dry-run            # simulação
  */
 
-const fs      = require('fs');
-const path    = require('path');
+const fs       = require('fs');
+const path     = require('path');
 const minimist = require('minimist');
-const chalk   = require('chalk');
-const pLimit  = require('p-limit');
+const chalk    = require('chalk');
 const TenantAuth  = require('./auth');
 const GraphClient = require('./graphClient');
 const UserLoader  = require('./userLoader');
+const pLimit   = require('p-limit');
 const Logger      = require('./logger');
 
 const MIGRATION_PROPERTY_ID = 'String {8ECCC264-6880-4EBE-992F-8888D2EEAA1D} Name SourceMessageId';
 
-const argv        = minimist(process.argv.slice(2));
-const ONLY_USER   = argv.user || argv.u || null;
-const DRY_RUN     = argv['dry-run'] || argv.d || false;
-const CONCURRENCY = parseInt(argv.concurrency || argv.c || '3', 10);
-const PAGE_SIZE   = 100;
+const argv      = minimist(process.argv.slice(2));
+const ONLY_USER = argv.user || argv.u || null;
+const DRY_RUN   = argv['dry-run'] || argv.d || false;
+const PAGE_SIZE = 100;
+
+// Conservative delays to avoid rate limiting
+const THROTTLE_MS    = 400;  // between individual API calls
+const PHASE_DELAY_MS = 3000; // between delete and create phases
+const CONCURRENCY    = 2;    // parallel per phase
 
 const WELL_KNOWN = {
-  'Caixa de Entrada': 'inbox',     'Inbox': 'inbox',
-  'Itens Enviados':   'sentitems', 'Sent Items': 'sentitems',
-  'Itens Excluídos':  'deleteditems', 'Deleted Items': 'deleteditems',
-  'Rascunhos':        'drafts',    'Drafts': 'drafts',
-  'Lixo Eletrônico':  'junkemail', 'Junk Email': 'junkemail',
-  'Arquivo Morto':    'archive',   'Archive': 'archive',
+  'Caixa de Entrada': 'inbox',       'Inbox': 'inbox',
+  'Itens Enviados':   'sentitems',   'Sent Items': 'sentitems',
+  'Itens Excluídos':  'deleteditems','Deleted Items': 'deleteditems',
+  'Rascunhos':        'drafts',      'Drafts': 'drafts',
+  'Lixo Eletrônico':  'junkemail',   'Junk Email': 'junkemail',
+  'Arquivo Morto':    'archive',     'Archive': 'archive',
 };
 
 let config;
@@ -52,7 +52,6 @@ try {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// Sanitize headers: only x-, no duplicates, max 5
 function sanitizeHeaders(headers) {
   const seen = new Set();
   const out  = [];
@@ -66,9 +65,6 @@ function sanitizeHeaders(headers) {
   return out.slice(0, 5);
 }
 
-// Build the corrected message payload
-// KEY: Integer 0x0E07 = 1 removes the draft flag at creation time.
-// PATCH isDraft:false is silently ignored by Graph API.
 function buildPayload(msg, sourceId, includeHeaders) {
   const originalDate = msg.receivedDateTime || msg.sentDateTime;
   return {
@@ -88,18 +84,16 @@ function buildPayload(msg, sourceId, includeHeaders) {
       ? { internetMessageHeaders: sanitizeHeaders(msg.internetMessageHeaders) }
       : {}),
     singleValueExtendedProperties: [
-      // Preserve original dates
       originalDate     && { id: 'SystemTime 0x0E06', value: originalDate },
       msg.sentDateTime && { id: 'SystemTime 0x0039', value: msg.sentDateTime },
-      // Remove draft flag — the ONLY way that works in Graph API
-      { id: 'Integer 0x0E07', value: '1' },
-      // Track source message ID for future dedup
+      { id: 'String 0x001A', value: 'IPM.Note' },   // message class = email
+      { id: 'Integer 0x0E07', value: '5' },          // PR_MESSAGE_FLAGS: Read(1)+Submit(4) = non-draft
+      { id: 'Integer 0x0E17', value: '1' },          // PR_MESSAGE_STATE: not draft
       sourceId && { id: MIGRATION_PROPERTY_ID, value: sourceId }
     ].filter(Boolean)
   };
 }
 
-// Resolve folder ID fresh from API each time to avoid stale IDs
 async function resolveFolderFresh(client, userEmail, folderName) {
   if (WELL_KNOWN[folderName]) {
     try {
@@ -107,16 +101,12 @@ async function resolveFolderFresh(client, userEmail, folderName) {
       return f.id;
     } catch (e) { /* fall through */ }
   }
-  for await (const f of client.paginate(`/users/${userEmail}/mailFolders`)) {
+  for await (const f of client.paginate(`/users/${userEmail}/mailFolders`, { '$top': 50 })) {
     if (f.displayName === folderName) return f.id;
-    for await (const c of client.paginate(`/users/${userEmail}/mailFolders/${f.id}/childFolders`)) {
-      if (c.displayName === folderName) return c.id;
-    }
   }
   return null;
 }
 
-// Get all drafts in a folder
 async function getDrafts(client, userEmail, folderId) {
   const drafts = [];
   let skip = 0;
@@ -126,7 +116,7 @@ async function getDrafts(client, userEmail, folderId) {
       {
         '$top': PAGE_SIZE, '$skip': skip,
         '$filter': 'isDraft eq true',
-        '$select': 'id,subject,receivedDateTime,sentDateTime,body,from,toRecipients,ccRecipients,bccRecipients,replyTo,flag,importance,isRead,isDraft',
+        '$select': 'id,subject,receivedDateTime,sentDateTime,body,from,toRecipients,ccRecipients,bccRecipients,replyTo,flag,importance,isRead',
         '$expand': `singleValueExtendedProperties($filter=id eq '${MIGRATION_PROPERTY_ID}')`
       }
     );
@@ -138,31 +128,28 @@ async function getDrafts(client, userEmail, folderId) {
   return drafts;
 }
 
-// Try to fetch original from source
 async function fetchOriginal(srcClient, srcEmail, srcFolderId, draft) {
   const sourceProp = draft.singleValueExtendedProperties?.find(p => p.id === MIGRATION_PROPERTY_ID);
   const sourceId   = sourceProp?.value || null;
 
-  // Method 1: fetch directly by source ID
   if (sourceId) {
     try {
       return await srcClient.get(
         `/users/${srcEmail}/messages/${sourceId}`,
-        { '$select': 'id,subject,receivedDateTime,sentDateTime,isDraft,body,from,toRecipients,ccRecipients,bccRecipients,replyTo,flag,importance,isRead,internetMessageHeaders' }
+        { '$select': 'id,subject,receivedDateTime,sentDateTime,body,from,toRecipients,ccRecipients,bccRecipients,replyTo,flag,importance,isRead,internetMessageHeaders' }
       );
     } catch (e) { /* fall through */ }
   }
 
-  // Method 2: search by subject + receivedDateTime
   if (draft.subject && draft.receivedDateTime) {
     try {
-      const safe = draft.subject.replace(/'/g, "''");
+      const safe   = draft.subject.replace(/'/g, "''");
       const result = await srcClient.get(
         `/users/${srcEmail}/mailFolders/${srcFolderId}/messages`,
         {
           '$top': 1,
           '$filter': `subject eq '${safe}' and receivedDateTime eq ${draft.receivedDateTime}`,
-          '$select': 'id,subject,receivedDateTime,sentDateTime,isDraft,body,from,toRecipients,ccRecipients,bccRecipients,replyTo,flag,importance,isRead,internetMessageHeaders'
+          '$select': 'id,subject,receivedDateTime,sentDateTime,body,from,toRecipients,ccRecipients,bccRecipients,replyTo,flag,importance,isRead,internetMessageHeaders'
         }
       );
       if (result.value?.[0]) return result.value[0];
@@ -172,33 +159,117 @@ async function fetchOriginal(srcClient, srcEmail, srcFolderId, draft) {
   return null;
 }
 
-// Process one user
-async function processUser(srcClient, tgtClient, user, logger) {
-  const stats = { fixed: 0, failed: 0, total: 0 };
+async function fixFolder(srcClient, tgtClient, srcEmail, tgtEmail, srcFolder, tgtFolderId, logger, stats) {
+  const drafts = await getDrafts(tgtClient, tgtEmail, tgtFolderId);
+  if (drafts.length === 0) return;
 
+  logger.info(`\n   📁 ${srcFolder.displayName}: ${chalk.yellow(drafts.length + ' drafts')}`);
+
+  if (DRY_RUN) {
+    for (const d of drafts) logger.info(`   [DRY RUN] Would fix: "${d.subject}"`);
+    stats.fixed += drafts.length;
+    return;
+  }
+
+  // ── PHASE 1: Fetch originals (concurrency 2) ────────────────────────────
+  logger.info(`   ⬇️  Phase 1/3: Fetching originals...`);
+  const limit1 = pLimit(CONCURRENCY);
+  const enriched = await Promise.all(
+    drafts.map(draft => limit1(async () => {
+      const original = await fetchOriginal(srcClient, srcEmail, srcFolder.id, draft);
+      await sleep(THROTTLE_MS);
+      return { draft, original };
+    }))
+  );
+  const foundCount = enriched.filter(e => e.original).length;
+  logger.info(`   ✓ ${foundCount} found in source, ${enriched.length - foundCount} will use draft copy`);
+
+  // ── PHASE 2: Delete all drafts (concurrency 2) ──────────────────────────
+  logger.info(`   🗑️  Phase 2/3: Deleting ${drafts.length} drafts...`);
+  const limit2 = pLimit(CONCURRENCY);
+  const deleteResults = await Promise.all(
+    enriched.map(({ draft }) => limit2(async () => {
+      try {
+        await tgtClient.request('DELETE', `/users/${tgtEmail}/messages/${draft.id}`);
+        await sleep(THROTTLE_MS);
+        return { id: draft.id, ok: true };
+      } catch (e) {
+        logger.warn(`   ⚠️  Delete failed "${draft.subject}": ${e.message}`);
+        return { id: draft.id, ok: false };
+      }
+    }))
+  );
+  const deleted = deleteResults.filter(r => r.ok).map(r => r.id);
+  logger.info(`   ✓ ${deleted.length}/${drafts.length} deleted`);
+
+  // Wait for Exchange to settle
+  logger.info(`   ⏳ Waiting ${PHASE_DELAY_MS/1000}s for Exchange to settle...`);
+  await sleep(PHASE_DELAY_MS);
+
+  // Resolve folder fresh once
+  const freshFolderId = await resolveFolderFresh(tgtClient, tgtEmail, srcFolder.displayName);
+  if (!freshFolderId) {
+    logger.error(`   ✗ Could not resolve folder "${srcFolder.displayName}"`);
+    stats.failed += drafts.length;
+    return;
+  }
+
+  // ── PHASE 3: Recreate (concurrency 2) ───────────────────────────────────
+  logger.info(`   ✉️  Phase 3/3: Recreating ${deleted.length} messages...`);
+  const deletedSet = new Set(deleted);
+  const toCreate   = enriched.filter(e => deletedSet.has(e.draft.id));
+  const limit3     = pLimit(CONCURRENCY);
+
+  const createResults = await Promise.all(
+    toCreate.map(({ draft, original }) => limit3(async () => {
+      try {
+        const payload = original
+          ? buildPayload(original, original.id, true)
+          : buildPayload(draft, null, false);
+        await tgtClient.post(
+          `/users/${tgtEmail}/mailFolders/${freshFolderId}/messages`,
+          payload
+        );
+        await sleep(THROTTLE_MS);
+        return true;
+      } catch (e) {
+        logger.error(`   ✗ Create failed "${draft.subject}": ${e.message}`);
+        return false;
+      }
+    }))
+  );
+  const created = createResults.filter(Boolean).length;
+  const failed  = createResults.filter(r => !r).length;
+
+  logger.info(`   ✓ Phase 3 done: ${created} created, ${failed} failed`);
+  stats.fixed  += created;
+  stats.failed += failed;
+}
+
+async function processUser(srcClient, tgtClient, user, logger) {
+  const stats = { fixed: 0, failed: 0 };
   logger.info(`\n👤 ${user.sourceEmail} → ${user.targetEmail}`);
 
-  // Load folders from both tenants
+  // Load folders with $expand — fewer API calls
+  logger.info('   📂 Loading folders...');
   const srcFolders = [];
-  for await (const f of srcClient.paginate(`/users/${user.sourceEmail}/mailFolders`)) {
+  for await (const f of srcClient.paginate(`/users/${user.sourceEmail}/mailFolders`, { '$expand': 'childFolders', '$top': 100 })) {
     srcFolders.push(f);
-    for await (const c of srcClient.paginate(`/users/${user.sourceEmail}/mailFolders/${f.id}/childFolders`)) {
-      srcFolders.push(c);
-    }
+    if (f.childFolders?.length) srcFolders.push(...f.childFolders);
   }
 
   const tgtFolderMap = {};
-  for await (const f of tgtClient.paginate(`/users/${user.targetEmail}/mailFolders`)) {
+  for await (const f of tgtClient.paginate(`/users/${user.targetEmail}/mailFolders`, { '$expand': 'childFolders', '$top': 100 })) {
     tgtFolderMap[f.displayName] = f.id;
-    for await (const c of tgtClient.paginate(`/users/${user.targetEmail}/mailFolders/${f.id}/childFolders`)) {
-      tgtFolderMap[c.displayName] = c.id;
+    if (f.childFolders?.length) {
+      for (const c of f.childFolders) tgtFolderMap[c.displayName] = c.id;
     }
   }
+  logger.info(`   ✓ ${srcFolders.length} source, ${Object.keys(tgtFolderMap).length} target folders`);
 
-  const limit = pLimit(CONCURRENCY);
+  let totalDrafts = 0;
 
   for (const srcFolder of srcFolders) {
-    // Resolve target folder ID
     let tgtFolderId = tgtFolderMap[srcFolder.displayName];
     if (!tgtFolderId && WELL_KNOWN[srcFolder.displayName]) {
       try {
@@ -208,83 +279,23 @@ async function processUser(srcClient, tgtClient, user, logger) {
     }
     if (!tgtFolderId) continue;
 
-    const drafts = await getDrafts(tgtClient, user.targetEmail, tgtFolderId);
-    if (drafts.length === 0) continue;
-
-    stats.total += drafts.length;
-    logger.info(`   📁 ${srcFolder.displayName}: ${chalk.yellow(drafts.length + ' drafts')} — fixing with concurrency ${CONCURRENCY}...`);
-
-    // ── PARALLEL: Worker A (fetch original) + Worker B (delete+create) ──────
-    // We build tasks that each: fetch original → delete draft → create correct
-    // This is naturally parallel via p-limit — up to CONCURRENCY tasks at once.
-    // Worker A and B are merged per-message to avoid race conditions.
-
-    const tasks = drafts.map(draft => limit(async () => {
-      if (DRY_RUN) {
-        logger.info(`   [DRY RUN] Would fix: "${draft.subject}"`);
-        stats.fixed++;
-        return;
-      }
-
-      // ── Worker A: fetch original from source ──────────────────────────────
-      const original = await fetchOriginal(srcClient, user.sourceEmail, srcFolder.id, draft);
-
-      // ── Resolve folder ID fresh before creating ───────────────────────────
-      const freshFolderId = await resolveFolderFresh(tgtClient, user.targetEmail, srcFolder.displayName);
-      if (!freshFolderId) {
-        logger.error(`   ✗ Folder "${srcFolder.displayName}" not found — skipping "${draft.subject}"`);
-        stats.failed++;
-        return;
-      }
-
-      try {
-        // ── Worker B: delete old draft ────────────────────────────────────
-        await tgtClient.request('DELETE', `/users/${user.targetEmail}/messages/${draft.id}`);
-
-        // ── Worker B: create corrected message ────────────────────────────
-        const payload = original
-          ? buildPayload(original, original.id, true)   // from source — with clean headers
-          : buildPayload(draft,    null,         false); // from draft  — no headers (safe)
-
-        await tgtClient.post(
-          `/users/${user.targetEmail}/mailFolders/${freshFolderId}/messages`,
-          payload
-        );
-
-        // NOTE: NO PATCH isDraft:false — it is silently ignored by Graph API.
-        // The Integer 0x0E07 = 1 in the payload above is the correct mechanism.
-
-        logger.info(`   ✓ ${original ? 'Fixed' : 'Recreated'}: "${draft.subject}"`);
-        stats.fixed++;
-
-      } catch (err) {
-        logger.error(`   ✗ Failed "${draft.subject}": ${err.message}`);
-        stats.failed++;
-      }
-    }));
-
-    await Promise.all(tasks);
-
-    logger.info(`   ✅ ${srcFolder.displayName} done: ${stats.fixed} fixed, ${stats.failed} failed`);
+    await fixFolder(srcClient, tgtClient, user.sourceEmail, user.targetEmail, srcFolder, tgtFolderId, logger, stats);
+    totalDrafts += stats.fixed + stats.failed;
   }
 
-  if (stats.total === 0) {
-    logger.info('   ✅ No drafts found — nothing to fix!');
-  } else {
-    logger.success(`   User complete: ${stats.fixed}/${stats.total} fixed, ${stats.failed} failed`);
-  }
+  if (totalDrafts === 0) logger.info('   ✅ No drafts found!');
+  else logger.success(`   Done: ${stats.fixed} fixed, ${stats.failed} failed`);
 
   return stats;
 }
 
-// Main
 async function main() {
   const mainLogger = new Logger(config.logs_dir || './logs', 'fixdrafts');
 
   console.log(chalk.bold.cyan('\n🔧 M365 Draft Fixer'));
-  console.log(chalk.gray(`   Source:      ${config.source_tenant.domain}`));
-  console.log(chalk.gray(`   Target:      ${config.target_tenant.domain}`));
-  console.log(chalk.gray(`   Concurrency: ${CONCURRENCY} parallel fixes`));
+  console.log(chalk.gray(`   Source: ${config.source_tenant.domain}`));
+  console.log(chalk.gray(`   Target: ${config.target_tenant.domain}`));
+  console.log(chalk.gray(`   Mode:   Sequential (no concurrency)`));
   if (DRY_RUN) console.log(chalk.yellow('   ⚠️  DRY RUN\n'));
   else console.log('');
 
@@ -300,12 +311,13 @@ async function main() {
   const tgtAuth = new TenantAuth(config.target_tenant, 'TARGET');
   await srcAuth.getToken();
   await tgtAuth.getToken();
-  const srcClient = new GraphClient(srcAuth, config.migration, mainLogger);
-  const tgtClient = new GraphClient(tgtAuth, config.migration, mainLogger);
+
+  const fixConfig = { ...config.migration, throttle_delay_ms: THROTTLE_MS };
+  const srcClient = new GraphClient(srcAuth, fixConfig, mainLogger);
+  const tgtClient = new GraphClient(tgtAuth, fixConfig, mainLogger);
   mainLogger.success('Both tenants authenticated ✓\n');
 
   const globalStats = { fixed: 0, failed: 0 };
-
   for (const user of users) {
     const logger = new Logger(config.logs_dir || './logs', user.sourceEmail);
     try {
@@ -319,9 +331,9 @@ async function main() {
 
   console.log('\n' + chalk.bold('─'.repeat(50)));
   console.log(chalk.bold.green('✅ Fix complete!'));
-  console.log(chalk.green(`   Fixed:    ${globalStats.fixed}`));
+  console.log(chalk.green(`   Fixed:  ${globalStats.fixed}`));
   if (globalStats.failed > 0)
-    console.log(chalk.red(`   Failed:   ${globalStats.failed}`));
+    console.log(chalk.red(`   Failed: ${globalStats.failed}`));
   console.log('');
 }
 
