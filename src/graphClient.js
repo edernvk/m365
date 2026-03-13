@@ -152,6 +152,10 @@ class GraphClient {
     return this.request('PATCH', url, data);
   }
 
+  async delete(url) {
+    return this.request('DELETE', url);
+  }
+
   // Paginate through all pages of a Graph API collection
   async *paginate(url, params = {}, context = 'items') {
     let nextUrl = url;

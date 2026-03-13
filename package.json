@@ -9,7 +9,9 @@
     "migrate:onedrive": "node src/migrator.js --workload onedrive",
     "migrate:calendar": "node src/migrator.js --workload calendar",
     "migrate:all": "node src/migrator.js --workload all",
-    "status": "node src/status.js"
+    "status": "node src/status.js",
+    "fix:drafts": "node src/fixDrafts.js",
+    "fix:drafts:dry": "node src/fixDrafts.js --dry-run"
   },
   "dependencies": {
     "@azure/msal-node": "^2.6.0",

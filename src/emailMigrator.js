@@ -415,13 +415,15 @@ class EmailMigrator {
       receivedDateTime: msg.receivedDateTime,
       sentDateTime: msg.sentDateTime,
       isRead:    msg.isRead,
-      isDraft:   false, // OTIMIZAÇÃO: Criar já como não-draft (economiza 1 PATCH por mensagem!)
       flag:      msg.flag,
       importance: msg.importance || 'normal',
       singleValueExtendedProperties: [
         // Preservar datas originais
         { id: 'SystemTime 0x0E06', value: originalDate },
         { id: 'SystemTime 0x0039', value: msg.sentDateTime || originalDate },
+        // CRÍTICO: Remove flag de rascunho (PR_MESSAGE_FLAGS = sent+received, não draft)
+        // isDraft via PATCH é ignorado pela API — esta é a única forma correta
+        { id: 'Integer 0x0E07', value: '1' },
         // CRÍTICO: Armazenar ID da mensagem fonte para deduplicação
         { id: MIGRATION_PROPERTY_ID, value: msg.id }
       ].filter(p => p.value) // Remove se não tiver valor
@@ -432,9 +434,8 @@ class EmailMigrator {
       payload
     );
 
-    // REMOVIDO: PATCH para marcar como não-draft (já criamos assim!)
-    // Economiza ~150-300ms por mensagem
-
+    // NOTE: isDraft is controlled by Integer 0x0E07 extended property above.
+    // PATCH isDraft:false is silently ignored by Graph API — do NOT use it.
     return created;
   }
 
