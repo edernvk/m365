@@ -46,7 +46,9 @@ const ONLY_USER  = argv.user || argv.u || null;
 const DRY_RUN    = argv['dry-run'] || argv.d || false;
 const BATCH_SIZE = Math.min(parseInt(argv['batch-size'] || '20', 10), 20); // Graph max is 20
 const PAGE_SIZE  = 100;
-const PHASE_DELAY_MS = 2000; // wait after bulk delete before recreating
+const PHASE_DELAY_MS    = 2000; // wait after bulk delete before recreating
+const BATCH_DELAY_MS    = 1500; // delay between create batches — prevents MailboxConcurrency limit
+const BATCH_PAUSE_EVERY = 5;    // pause longer every N batches to let Exchange breathe
 
 const WELL_KNOWN = {
   'Caixa de Entrada': 'inbox',       'Inbox': 'inbox',
@@ -294,19 +296,37 @@ async function fixFolder(srcClient, tgtClient, srcAuth, tgtAuth, srcEmail, tgtEm
 
     const results = await sendBatch(tgtAuth, requests);
 
+    let batchCreated = 0;
     for (const e of batch) {
       const r = results[e.draft.id];
       if (r && r.status === 201) {
         created++;
+        batchCreated++;
       } else {
         const errMsg = r?.body?.error?.message || `status ${r?.status}`;
-        logger.error(`   ✗ Create failed "${e.draft.subject}": ${errMsg}`);
+        // Retry-able errors — will be picked up on next run
+        if (errMsg.includes('Request limit') || errMsg.includes('MailboxConcurrency')) {
+          logger.warn(`   ⚠️  Quota hit on "${e.draft.subject}" — will retry on next run`);
+        } else {
+          logger.error(`   ✗ Create failed "${e.draft.subject}": ${errMsg}`);
+        }
         failed++;
       }
     }
 
     const progress = Math.min((i + 1) * BATCH_SIZE, toCreate.length);
-    logger.info(`   ✉️  [${progress}/${toCreate.length}] ${Math.round(progress/toCreate.length*100)}% — batch ${i+1}/${createChunks.length}`);
+    logger.info(`   ✉️  [${progress}/${toCreate.length}] ${Math.round(progress/toCreate.length*100)}% — batch ${i+1}/${createChunks.length} (${batchCreated}/${batch.length} ok)`);
+
+    // Pause between batches to avoid MailboxConcurrency and Request limit errors
+    if (i < createChunks.length - 1) {
+      if ((i + 1) % BATCH_PAUSE_EVERY === 0) {
+        // Every 10 batches (200 msgs), pause longer to let Exchange breathe
+        logger.info(`   ⏸️  Pausing 5s after ${(i+1) * BATCH_SIZE} messages...`);
+        await sleep(5000);
+      } else {
+        await sleep(BATCH_DELAY_MS);
+      }
+    }
   }
 
   logger.info(`   ✓ Phase 3: ${created} created, ${failed} failed`);
