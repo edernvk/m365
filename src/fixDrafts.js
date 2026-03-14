@@ -35,6 +35,7 @@ const axios    = require('axios');
 const TenantAuth  = require('./auth');
 const GraphClient = require('./graphClient');
 const UserLoader  = require('./userLoader');
+const pLimit   = require('p-limit');
 const Logger      = require('./logger');
 
 const MIGRATION_PROPERTY_ID = 'String {8ECCC264-6880-4EBE-992F-8888D2EEAA1D} Name SourceMessageId';
@@ -212,19 +213,21 @@ async function fixFolder(srcClient, tgtClient, srcAuth, tgtAuth, srcEmail, tgtEm
     return;
   }
 
-  // ── PHASE 1: Fetch originals sequentially (source reads) ─────────────────
-  // Sequential here to avoid hammering source tenant
-  logger.info(`   ⬇️  Phase 1/3: Fetching ${drafts.length} originals from source...`);
-  const enriched = [];
+  // ── PHASE 1: Fetch originals from source (concurrency 3) ───────────────
+  // 3 concurrent reads against source tenant — safe within 4 concurrent/app/mailbox limit
+  logger.info(`   ⬇️  Phase 1/3: Fetching ${drafts.length} originals from source (concurrency 3)...`);
+  const fetchLimit = pLimit(4); // 4 = documented max concurrent requests per app per mailbox (Graph API)
   let fetchCount = 0;
-  for (const draft of drafts) {
-    const original = await fetchOriginal(srcClient, srcEmail, srcFolder.id, draft);
-    enriched.push({ draft, original });
-    fetchCount++;
-    if (fetchCount % 100 === 0 || fetchCount === drafts.length) {
-      logger.info(`   ⬇️  [${fetchCount}/${drafts.length}] ${Math.round(fetchCount/drafts.length*100)}%`);
-    }
-  }
+  const enriched = await Promise.all(
+    drafts.map(draft => fetchLimit(async () => {
+      const original = await fetchOriginal(srcClient, srcEmail, srcFolder.id, draft);
+      fetchCount++;
+      if (fetchCount % 500 === 0 || fetchCount === drafts.length) {
+        logger.info(`   ⬇️  [${fetchCount}/${drafts.length}] ${Math.round(fetchCount/drafts.length*100)}%`);
+      }
+      return { draft, original };
+    }))
+  );
   const foundCount = enriched.filter(e => e.original).length;
   logger.info(`   ✓ Phase 1: ${foundCount} from source, ${enriched.length - foundCount} from draft copy`);
 
