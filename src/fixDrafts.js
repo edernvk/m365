@@ -29,9 +29,9 @@ const DRY_RUN   = argv['dry-run'] || argv.d || false;
 const PAGE_SIZE = 100;
 
 // Conservative delays to avoid rate limiting
-const THROTTLE_MS    = 150;  // between individual API calls
+const THROTTLE_MS    = 100;  // between individual API calls
 const PHASE_DELAY_MS = 2000; // between delete and create phases
-const CONCURRENCY    = 3;    // parallel per phase
+const CONCURRENCY    = 4;    // parallel per phase
 
 const WELL_KNOWN = {
   'Caixa de Entrada': 'inbox',       'Inbox': 'inbox',
