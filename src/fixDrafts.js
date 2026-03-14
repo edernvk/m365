@@ -2,36 +2,50 @@
 /**
  * fixDrafts.js — Corrige mensagens migradas incorretamente como [Rascunho]
  *
- * Execução 100% sequencial — sem concurrency para evitar rate limiting.
- * Por pasta: Fase 1 (fetch) → Fase 2 (delete) → delay → Fase 3 (create)
+ * MELHORIAS v4 (baseadas na documentação oficial Graph API):
+ *
+ * 1. JSON BATCHING: agrupa até 20 DELETEs/POSTs em 1 chamada HTTP
+ *    → Graph API envia 4 em paralelo internamente, respeitando os limites
+ *    → Reduz ~95% do número de chamadas HTTP e praticamente elimina rate limiting
+ *    → Fonte: https://learn.microsoft.com/en-us/graph/json-batching
+ *
+ * 2. DEDUP de pastas por ID: evita reprocessar a mesma pasta 2x
+ *    quando $expand retorna filhos tanto dentro do pai quanto como top-level
+ *
+ * 3. Folder ID reutilizado: não chama resolveFolderFresh() por mensagem,
+ *    usa o tgtFolderMap carregado no início (já tem IDs válidos)
+ *
+ * 4. MAPI flags corretos: Integer 0x0E07=5 (Read+Submit), String 0x001A=IPM.Note,
+ *    Integer 0x0E17=1 (PR_MESSAGE_STATE) — remove draft flag na criação
+ *
+ * 5. Sem throttle artificial: o batching já controla a taxa naturalmente
  *
  * Usage:
  *   node src/fixDrafts.js                      # todos os usuários
  *   node src/fixDrafts.js --user email@domain  # só um usuário
  *   node src/fixDrafts.js --dry-run            # simulação
+ *   node src/fixDrafts.js --batch-size 10      # tamanho do batch (default: 20)
  */
 
 const fs       = require('fs');
 const path     = require('path');
 const minimist = require('minimist');
 const chalk    = require('chalk');
+const axios    = require('axios');
 const TenantAuth  = require('./auth');
 const GraphClient = require('./graphClient');
 const UserLoader  = require('./userLoader');
-const pLimit   = require('p-limit');
 const Logger      = require('./logger');
 
 const MIGRATION_PROPERTY_ID = 'String {8ECCC264-6880-4EBE-992F-8888D2EEAA1D} Name SourceMessageId';
+const GRAPH_BATCH_URL = 'https://graph.microsoft.com/v1.0/$batch';
 
-const argv      = minimist(process.argv.slice(2));
-const ONLY_USER = argv.user || argv.u || null;
-const DRY_RUN   = argv['dry-run'] || argv.d || false;
-const PAGE_SIZE = 100;
-
-// Conservative delays to avoid rate limiting
-const THROTTLE_MS    = 150;  // between individual API calls
-const PHASE_DELAY_MS = 2000; // between delete and create phases
-const CONCURRENCY    = 3;    // parallel per phase
+const argv       = minimist(process.argv.slice(2));
+const ONLY_USER  = argv.user || argv.u || null;
+const DRY_RUN    = argv['dry-run'] || argv.d || false;
+const BATCH_SIZE = Math.min(parseInt(argv['batch-size'] || '20', 10), 20); // Graph max is 20
+const PAGE_SIZE  = 100;
+const PHASE_DELAY_MS = 2000; // wait after bulk delete before recreating
 
 const WELL_KNOWN = {
   'Caixa de Entrada': 'inbox',       'Inbox': 'inbox',
@@ -86,27 +100,52 @@ function buildPayload(msg, sourceId, includeHeaders) {
     singleValueExtendedProperties: [
       originalDate     && { id: 'SystemTime 0x0E06', value: originalDate },
       msg.sentDateTime && { id: 'SystemTime 0x0039', value: msg.sentDateTime },
-      { id: 'String 0x001A', value: 'IPM.Note' },   // message class = email
-      { id: 'Integer 0x0E07', value: '5' },          // PR_MESSAGE_FLAGS: Read(1)+Submit(4) = non-draft
+      { id: 'String 0x001A',  value: 'IPM.Note' },  // message class
+      { id: 'Integer 0x0E07', value: '5' },          // Read(1)+Submit(4) = non-draft
       { id: 'Integer 0x0E17', value: '1' },          // PR_MESSAGE_STATE: not draft
       sourceId && { id: MIGRATION_PROPERTY_ID, value: sourceId }
     ].filter(Boolean)
   };
 }
 
-async function resolveFolderFresh(client, userEmail, folderName) {
-  if (WELL_KNOWN[folderName]) {
-    try {
-      const f = await client.get(`/users/${userEmail}/mailFolders/${WELL_KNOWN[folderName]}`);
-      return f.id;
-    } catch (e) { /* fall through */ }
+// ── JSON Batch helper ─────────────────────────────────────────────────────────
+// Sends up to 20 requests in a single HTTP call to /$batch
+// Returns map of { id → { status, body } }
+async function sendBatch(authInstance, requests) {
+  const token = await authInstance.getToken();
+  const response = await axios.post(
+    GRAPH_BATCH_URL,
+    { requests },
+    {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      validateStatus: null
+    }
+  );
+
+  if (response.status === 429) {
+    const retryAfter = parseInt(response.headers['retry-after'] || '10') * 1000;
+    await sleep(retryAfter);
+    return sendBatch(authInstance, requests); // retry
   }
-  for await (const f of client.paginate(`/users/${userEmail}/mailFolders`, { '$top': 50 })) {
-    if (f.displayName === folderName) return f.id;
+
+  const results = {};
+  for (const r of (response.data?.responses || [])) {
+    results[r.id] = { status: r.status, body: r.body };
   }
-  return null;
+  return results;
 }
 
+// ── Chunk array into groups of N ─────────────────────────────────────────────
+function chunk(arr, size) {
+  const chunks = [];
+  for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
+  return chunks;
+}
+
+// ── Get all drafts in a folder ────────────────────────────────────────────────
 async function getDrafts(client, userEmail, folderId) {
   const drafts = [];
   let skip = 0;
@@ -128,6 +167,7 @@ async function getDrafts(client, userEmail, folderId) {
   return drafts;
 }
 
+// ── Fetch original from source by SourceMessageId or subject+date ─────────────
 async function fetchOriginal(srcClient, srcEmail, srcFolderId, draft) {
   const sourceProp = draft.singleValueExtendedProperties?.find(p => p.id === MIGRATION_PROPERTY_ID);
   const sourceId   = sourceProp?.value || null;
@@ -159,127 +199,136 @@ async function fetchOriginal(srcClient, srcEmail, srcFolderId, draft) {
   return null;
 }
 
-async function fixFolder(srcClient, tgtClient, srcEmail, tgtEmail, srcFolder, tgtFolderId, logger, stats) {
+// ── Fix all drafts in a folder ────────────────────────────────────────────────
+async function fixFolder(srcClient, tgtClient, srcAuth, tgtAuth, srcEmail, tgtEmail, srcFolder, tgtFolderId, logger, stats) {
   const drafts = await getDrafts(tgtClient, tgtEmail, tgtFolderId);
   if (drafts.length === 0) return;
 
   logger.info(`\n   📁 ${srcFolder.displayName}: ${chalk.yellow(drafts.length + ' drafts')}`);
 
   if (DRY_RUN) {
-    for (const d of drafts) logger.info(`   [DRY RUN] Would fix: "${d.subject}"`);
+    logger.info(`   [DRY RUN] Would fix ${drafts.length} drafts`);
     stats.fixed += drafts.length;
     return;
   }
 
-  // ── PHASE 1: Fetch originals (concurrency 3) ────────────────────────────
-  logger.info(`   ⬇️  Phase 1/3: Fetching ${drafts.length} originals...`);
-  const limit1 = pLimit(CONCURRENCY);
+  // ── PHASE 1: Fetch originals sequentially (source reads) ─────────────────
+  // Sequential here to avoid hammering source tenant
+  logger.info(`   ⬇️  Phase 1/3: Fetching ${drafts.length} originals from source...`);
+  const enriched = [];
   let fetchCount = 0;
-  const enriched = await Promise.all(
-    drafts.map(draft => limit1(async () => {
-      const original = await fetchOriginal(srcClient, srcEmail, srcFolder.id, draft);
-      await sleep(THROTTLE_MS);
-      fetchCount++;
-      if (fetchCount % 50 === 0 || fetchCount === drafts.length) {
-        const pct = Math.round((fetchCount / drafts.length) * 100);
-        const subj = (draft.subject || '').substring(0, 50);
-        logger.info(`   ⬇️  [${fetchCount}/${drafts.length}] ${pct}% — "${subj}"`);
-      }
-      return { draft, original };
-    }))
-  );
+  for (const draft of drafts) {
+    const original = await fetchOriginal(srcClient, srcEmail, srcFolder.id, draft);
+    enriched.push({ draft, original });
+    fetchCount++;
+    if (fetchCount % 100 === 0 || fetchCount === drafts.length) {
+      logger.info(`   ⬇️  [${fetchCount}/${drafts.length}] ${Math.round(fetchCount/drafts.length*100)}%`);
+    }
+  }
   const foundCount = enriched.filter(e => e.original).length;
-  logger.info(`   ✓ Phase 1 done: ${foundCount} from source, ${enriched.length - foundCount} from draft copy`);
+  logger.info(`   ✓ Phase 1: ${foundCount} from source, ${enriched.length - foundCount} from draft copy`);
 
-  // ── PHASE 2: Delete all drafts (concurrency 3) ──────────────────────────
-  logger.info(`   🗑️  Phase 2/3: Deleting ${drafts.length} drafts...`);
-  const limit2 = pLimit(CONCURRENCY);
-  let delCount = 0;
-  const deleteResults = await Promise.all(
-    enriched.map(({ draft }) => limit2(async () => {
-      try {
-        await tgtClient.request('DELETE', `/users/${tgtEmail}/messages/${draft.id}`);
-        await sleep(THROTTLE_MS);
-        delCount++;
-        if (delCount % 50 === 0 || delCount === drafts.length) {
-          const pct = Math.round((delCount / drafts.length) * 100);
-          const subj = (draft.subject || '').substring(0, 50);
-          logger.info(`   🗑️  [${delCount}/${drafts.length}] ${pct}% — "${subj}"`);
-        }
-        return { id: draft.id, ok: true };
-      } catch (e) {
-        logger.warn(`   ⚠️  Delete failed "${draft.subject}": ${e.message}`);
-        return { id: draft.id, ok: false };
+  // ── PHASE 2: Batch DELETE all drafts ─────────────────────────────────────
+  // Each batch of 20 = 1 HTTP call instead of 20
+  logger.info(`   🗑️  Phase 2/3: Batch deleting ${drafts.length} drafts (${BATCH_SIZE}/batch)...`);
+  const deleted = new Set();
+  const deleteChunks = chunk(enriched, BATCH_SIZE);
+
+  for (let i = 0; i < deleteChunks.length; i++) {
+    const batch = deleteChunks[i];
+    // Use message ID as batch request ID — guarantees unique mapping across chunks
+    const requests = batch.map(e => ({
+      id: e.draft.id,
+      method: 'DELETE',
+      url: `/users/${tgtEmail}/messages/${e.draft.id}`
+    }));
+
+    const results = await sendBatch(tgtAuth, requests);
+
+    for (const e of batch) {
+      const r = results[e.draft.id];
+      if (r && r.status === 204) {
+        deleted.add(e.draft.id);
       }
-    }))
-  );
-  const deleted = deleteResults.filter(r => r.ok).map(r => r.id);
-  logger.info(`   ✓ Phase 2 done: ${deleted.length}/${drafts.length} deleted`);
+      // 404 = already gone from previous run — skip silently (no warning, not an error)
+    }
 
-  // Wait for Exchange to settle
+    const progress = Math.min((i + 1) * BATCH_SIZE, drafts.length);
+    logger.info(`   🗑️  [${progress}/${drafts.length}] ${Math.round(progress/drafts.length*100)}% — batch ${i+1}/${deleteChunks.length}`);
+  }
+  logger.info(`   ✓ Phase 2: ${deleted.size}/${drafts.length} deleted`);
+
+  // Wait for Exchange to settle after bulk delete
   logger.info(`   ⏳ Waiting ${PHASE_DELAY_MS/1000}s for Exchange to settle...`);
   await sleep(PHASE_DELAY_MS);
 
-  // Resolve folder fresh once
-  const freshFolderId = await resolveFolderFresh(tgtClient, tgtEmail, srcFolder.displayName);
-  if (!freshFolderId) {
-    logger.error(`   ✗ Could not resolve folder "${srcFolder.displayName}"`);
-    stats.failed += drafts.length;
+  // ── PHASE 3: Batch CREATE corrected messages ──────────────────────────────
+  const toCreate = enriched.filter(e => deleted.has(e.draft.id));
+  if (toCreate.length === 0) {
+    logger.info(`   ✉️  Phase 3/3: Nothing to create (all deletes failed or already gone)`);
     return;
   }
 
-  // ── PHASE 3: Recreate (concurrency 2) ───────────────────────────────────
-  logger.info(`   ✉️  Phase 3/3: Recreating ${deleted.length} messages...`);
-  const deletedSet = new Set(deleted);
-  const toCreate   = enriched.filter(e => deletedSet.has(e.draft.id));
-  const limit3     = pLimit(CONCURRENCY);
+  logger.info(`   ✉️  Phase 3/3: Batch creating ${toCreate.length} messages (${BATCH_SIZE}/batch)...`);
+  let created = 0, failed = 0;
+  const createChunks = chunk(toCreate, BATCH_SIZE);
 
-  let createCount = 0;
-  const createResults = await Promise.all(
-    toCreate.map(({ draft, original }) => limit3(async () => {
-      try {
-        const payload = original
-          ? buildPayload(original, original.id, true)
-          : buildPayload(draft, null, false);
-        await tgtClient.post(
-          `/users/${tgtEmail}/mailFolders/${freshFolderId}/messages`,
-          payload
-        );
-        await sleep(THROTTLE_MS);
-        createCount++;
-        if (createCount % 50 === 0 || createCount === toCreate.length) {
-          const pct  = Math.round((createCount / toCreate.length) * 100);
-          const subj = (draft.subject || '').substring(0, 50);
-          const src  = original ? '✓src' : '~draft';
-          logger.info(`   ✉️  [${createCount}/${toCreate.length}] ${pct}% ${src} — "${subj}"`);
-        }
-        return true;
-      } catch (e) {
-        logger.error(`   ✗ Create failed "${draft.subject}": ${e.message}`);
-        return false;
+  for (let i = 0; i < createChunks.length; i++) {
+    const batch = createChunks[i];
+    // Use source draft ID as batch request ID — unique per message
+    const requests = batch.map(e => {
+      const payload = e.original
+        ? buildPayload(e.original, e.original.id, true)
+        : buildPayload(e.draft, null, false);
+      return {
+        id: e.draft.id,
+        method: 'POST',
+        url: `/users/${tgtEmail}/mailFolders/${tgtFolderId}/messages`,
+        headers: { 'Content-Type': 'application/json' },
+        body: payload
+      };
+    });
+
+    const results = await sendBatch(tgtAuth, requests);
+
+    for (const e of batch) {
+      const r = results[e.draft.id];
+      if (r && r.status === 201) {
+        created++;
+      } else {
+        const errMsg = r?.body?.error?.message || `status ${r?.status}`;
+        logger.error(`   ✗ Create failed "${e.draft.subject}": ${errMsg}`);
+        failed++;
       }
-    }))
-  );
-  const created = createResults.filter(Boolean).length;
-  const failed  = createResults.filter(r => !r).length;
+    }
 
-  logger.info(`   ✓ Phase 3 done: ${created} created, ${failed} failed`);
+    const progress = Math.min((i + 1) * BATCH_SIZE, toCreate.length);
+    logger.info(`   ✉️  [${progress}/${toCreate.length}] ${Math.round(progress/toCreate.length*100)}% — batch ${i+1}/${createChunks.length}`);
+  }
+
+  logger.info(`   ✓ Phase 3: ${created} created, ${failed} failed`);
   stats.fixed  += created;
   stats.failed += failed;
 }
 
-async function processUser(srcClient, tgtClient, user, logger) {
+// ── Process a single user ─────────────────────────────────────────────────────
+async function processUser(srcClient, tgtClient, srcAuth, tgtAuth, user, logger) {
   const stats = { fixed: 0, failed: 0 };
   logger.info(`\n👤 ${user.sourceEmail} → ${user.targetEmail}`);
 
-  // Load folders with $expand — fewer API calls
   logger.info('   📂 Loading folders...');
-  const srcFolders = [];
-  for await (const f of srcClient.paginate(`/users/${user.sourceEmail}/mailFolders`, { '$expand': 'childFolders', '$top': 100 })) {
-    srcFolders.push(f);
-    if (f.childFolders?.length) srcFolders.push(...f.childFolders);
-  }
 
+  // Dedup by ID — $expand can return children both inside parent AND as top-level
+  const srcFolderMap = new Map();
+  for await (const f of srcClient.paginate(`/users/${user.sourceEmail}/mailFolders`, { '$expand': 'childFolders', '$top': 100 })) {
+    srcFolderMap.set(f.id, f);
+    if (f.childFolders?.length) {
+      for (const c of f.childFolders) srcFolderMap.set(c.id, c);
+    }
+  }
+  const srcFolders = [...srcFolderMap.values()];
+
+  // Target folder map: name → id (also deduped)
   const tgtFolderMap = {};
   for await (const f of tgtClient.paginate(`/users/${user.targetEmail}/mailFolders`, { '$expand': 'childFolders', '$top': 100 })) {
     tgtFolderMap[f.displayName] = f.id;
@@ -287,37 +336,45 @@ async function processUser(srcClient, tgtClient, user, logger) {
       for (const c of f.childFolders) tgtFolderMap[c.displayName] = c.id;
     }
   }
-  logger.info(`   ✓ ${srcFolders.length} source, ${Object.keys(tgtFolderMap).length} target folders`);
+  logger.info(`   ✓ ${srcFolders.length} source folders, ${Object.keys(tgtFolderMap).length} target folders`);
 
   let totalDrafts = 0;
 
   for (const srcFolder of srcFolders) {
+    // Find matching target folder — use map first, then well-known fallback
     let tgtFolderId = tgtFolderMap[srcFolder.displayName];
     if (!tgtFolderId && WELL_KNOWN[srcFolder.displayName]) {
       try {
         const f = await tgtClient.get(`/users/${user.targetEmail}/mailFolders/${WELL_KNOWN[srcFolder.displayName]}`);
         tgtFolderId = f.id;
+        tgtFolderMap[srcFolder.displayName] = tgtFolderId; // cache it
       } catch (e) { continue; }
     }
     if (!tgtFolderId) continue;
 
-    await fixFolder(srcClient, tgtClient, user.sourceEmail, user.targetEmail, srcFolder, tgtFolderId, logger, stats);
+    await fixFolder(
+      srcClient, tgtClient, srcAuth, tgtAuth,
+      user.sourceEmail, user.targetEmail,
+      srcFolder, tgtFolderId,
+      logger, stats
+    );
     totalDrafts += stats.fixed + stats.failed;
   }
 
-  if (totalDrafts === 0) logger.info('   ✅ No drafts found!');
-  else logger.success(`   Done: ${stats.fixed} fixed, ${stats.failed} failed`);
+  if (totalDrafts === 0) logger.info('   ✅ No drafts found — nothing to fix!');
+  else logger.success(`   User done: ${stats.fixed} fixed, ${stats.failed} failed`);
 
   return stats;
 }
 
+// ── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
   const mainLogger = new Logger(config.logs_dir || './logs', 'fixdrafts');
 
-  console.log(chalk.bold.cyan('\n🔧 M365 Draft Fixer'));
-  console.log(chalk.gray(`   Source: ${config.source_tenant.domain}`));
-  console.log(chalk.gray(`   Target: ${config.target_tenant.domain}`));
-  console.log(chalk.gray(`   Mode:   Sequential (no concurrency)`));
+  console.log(chalk.bold.cyan('\n🔧 M365 Draft Fixer v4'));
+  console.log(chalk.gray(`   Source:     ${config.source_tenant.domain}`));
+  console.log(chalk.gray(`   Target:     ${config.target_tenant.domain}`));
+  console.log(chalk.gray(`   Batch size: ${BATCH_SIZE} requests/call (JSON batching)`));
   if (DRY_RUN) console.log(chalk.yellow('   ⚠️  DRY RUN\n'));
   else console.log('');
 
@@ -334,20 +391,22 @@ async function main() {
   await srcAuth.getToken();
   await tgtAuth.getToken();
 
-  const fixConfig = { ...config.migration, throttle_delay_ms: 200 }; // GraphClient internal throttle
+  // Conservative throttle for listing — batching handles the bulk operations
+  const fixConfig = { ...config.migration, throttle_delay_ms: 300 };
   const srcClient = new GraphClient(srcAuth, fixConfig, mainLogger);
   const tgtClient = new GraphClient(tgtAuth, fixConfig, mainLogger);
   mainLogger.success('Both tenants authenticated ✓\n');
 
   const globalStats = { fixed: 0, failed: 0 };
+
   for (const user of users) {
     const logger = new Logger(config.logs_dir || './logs', user.sourceEmail);
     try {
-      const s = await processUser(srcClient, tgtClient, user, logger);
+      const s = await processUser(srcClient, tgtClient, srcAuth, tgtAuth, user, logger);
       globalStats.fixed  += s.fixed;
       globalStats.failed += s.failed;
     } catch (err) {
-      logger.error(`Fatal: ${err.message}`);
+      logger.error(`Fatal error for ${user.sourceEmail}: ${err.message}`);
     }
   }
 
