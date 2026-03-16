@@ -139,7 +139,7 @@ class OneDriveMigrator {
     try {
       for await (const item of this.tgt.paginate(
         `/users/${userEmail}/drive/items/${folderId}/children`,
-        { '$top': this.pageSize, '$select': 'id,name,size,file,folder,parentReference' }
+        { '$top': this.pageSize, '$select': 'id,name,size,file,folder,parentReference,lastModifiedDateTime,createdDateTime,fileSystemInfo' }
       )) {
         if (item.file) {
           const key = `${path}/${item.name}|${item.size}`.toLowerCase();
@@ -313,13 +313,13 @@ class OneDriveMigrator {
     const fileSize = srcItem.size || 0;
 
     if (fileSize <= 4 * 1024 * 1024) {
-      await this._uploadSmallFile(tgtEmail, tgtFolderId, srcItem.name, downloadUrl, fileSize);
+      await this._uploadSmallFile(tgtEmail, tgtFolderId, srcItem.name, downloadUrl, fileSize, srcItem);
     } else {
-      await this._uploadLargeFile(tgtEmail, tgtFolderId, srcItem.name, downloadUrl, fileSize);
+      await this._uploadLargeFile(tgtEmail, tgtFolderId, srcItem.name, downloadUrl, fileSize, srcItem);
     }
   }
 
-  async _uploadSmallFile(tgtEmail, tgtFolderId, fileName, downloadUrl, fileSize) {
+  async _uploadSmallFile(tgtEmail, tgtFolderId, fileName, downloadUrl, fileSize, srcItem = null) {
     const downloadResponse = await axios.get(downloadUrl, {
       responseType: 'arraybuffer',
       timeout: 120000
@@ -328,7 +328,7 @@ class OneDriveMigrator {
     const fileBuffer = Buffer.from(downloadResponse.data);
     const tgtHeaders = await this.tgt.auth.getHeaders();
     
-    await axios.put(
+    const uploadResp = await axios.put(
       `https://graph.microsoft.com/v1.0/users/${tgtEmail}/drive/items/${tgtFolderId}:/${encodeURIComponent(fileName)}:/content`,
       fileBuffer,
       {
@@ -338,12 +338,28 @@ class OneDriveMigrator {
           'Content-Length': fileBuffer.length
         },
         maxBodyLength: Infinity,
-        timeout: 120000
+        timeout: 120000,
+        validateStatus: null
       }
     );
+
+    // Preserve original file dates via PATCH after upload
+    if (srcItem && (srcItem.fileSystemInfo || srcItem.lastModifiedDateTime) && uploadResp.data?.id) {
+      try {
+        await this.tgt.patch(
+          `/users/${tgtEmail}/drive/items/${uploadResp.data.id}`,
+          {
+            fileSystemInfo: {
+              createdDateTime:      srcItem.fileSystemInfo?.createdDateTime      || srcItem.createdDateTime,
+              lastModifiedDateTime: srcItem.fileSystemInfo?.lastModifiedDateTime || srcItem.lastModifiedDateTime
+            }
+          }
+        );
+      } catch (e) { /* date preservation is best-effort */ }
+    }
   }
 
-  async _uploadLargeFile(tgtEmail, tgtFolderId, fileName, downloadUrl, fileSize) {
+  async _uploadLargeFile(tgtEmail, tgtFolderId, fileName, downloadUrl, fileSize, srcItem = null) {
     const tgtHeaders = await this.tgt.auth.getHeaders();
 
     const sessionResponse = await axios.post(
@@ -351,7 +367,9 @@ class OneDriveMigrator {
       {
         item: {
           '@microsoft.graph.conflictBehavior': 'fail',
-          name: fileName
+          name: fileName,
+          // Pass dates in upload session if available
+          ...(srcItem?.fileSystemInfo ? { fileSystemInfo: srcItem.fileSystemInfo } : {})
         }
       },
       { headers: tgtHeaders, timeout: 60000 }
@@ -361,6 +379,7 @@ class OneDriveMigrator {
     const CHUNK_SIZE = 10 * 1024 * 1024;
 
     let offset = 0;
+    let lastResp = null;
     while (offset < fileSize) {
       const end = Math.min(offset + CHUNK_SIZE - 1, fileSize - 1);
 
@@ -372,7 +391,7 @@ class OneDriveMigrator {
 
       const chunk = Buffer.from(chunkResponse.data);
 
-      await axios.put(uploadUrl, chunk, {
+      lastResp = await axios.put(uploadUrl, chunk, {
         headers: {
           'Content-Length': chunk.length,
           'Content-Range': `bytes ${offset}-${end}/${fileSize}`
@@ -383,6 +402,22 @@ class OneDriveMigrator {
       });
 
       offset += CHUNK_SIZE;
+    }
+
+    // Preserve dates via PATCH if we got the item id back (status 201 on last chunk)
+    const newItemId = lastResp?.data?.id;
+    if (newItemId && srcItem && (srcItem.fileSystemInfo || srcItem.lastModifiedDateTime)) {
+      try {
+        await this.tgt.patch(
+          `/users/${tgtEmail}/drive/items/${newItemId}`,
+          {
+            fileSystemInfo: {
+              createdDateTime:      srcItem.fileSystemInfo?.createdDateTime      || srcItem.createdDateTime,
+              lastModifiedDateTime: srcItem.fileSystemInfo?.lastModifiedDateTime || srcItem.lastModifiedDateTime
+            }
+          }
+        );
+      } catch (e) { /* best-effort */ }
     }
   }
 

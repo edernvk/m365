@@ -47,8 +47,8 @@ const DRY_RUN    = argv['dry-run'] || argv.d || false;
 const BATCH_SIZE = Math.min(parseInt(argv['batch-size'] || '20', 10), 20); // Graph max is 20
 const PAGE_SIZE  = 100;
 const PHASE_DELAY_MS    = 2000; // wait after bulk delete before recreating
-const BATCH_DELAY_MS    = 1500; // delay between create batches — prevents MailboxConcurrency limit
-const BATCH_PAUSE_EVERY = 5;    // pause longer every N batches to let Exchange breathe
+const BATCH_DELAY_MS    = 2000; // delay between create batches — prevents MailboxConcurrency limit
+const BATCH_PAUSE_EVERY = 3;    // pause longer every N batches to let Exchange breathe
 
 const WELL_KNOWN = {
   'Caixa de Entrada': 'inbox',       'Inbox': 'inbox',
@@ -114,7 +114,10 @@ function buildPayload(msg, sourceId, includeHeaders) {
 // ── JSON Batch helper ─────────────────────────────────────────────────────────
 // Sends up to 20 requests in a single HTTP call to /$batch
 // Returns map of { id → { status, body } }
-async function sendBatch(authInstance, requests) {
+// Retries automatically on 429 or empty responses (batch-level throttle)
+async function sendBatch(authInstance, requests, attempt = 1) {
+  const MAX_ATTEMPTS = 5;
+
   const token = await authInstance.getToken();
   const response = await axios.post(
     GRAPH_BATCH_URL,
@@ -128,14 +131,31 @@ async function sendBatch(authInstance, requests) {
     }
   );
 
+  // Batch-level 429 — wait and retry entire batch
   if (response.status === 429) {
     const retryAfter = parseInt(response.headers['retry-after'] || '10') * 1000;
     await sleep(retryAfter);
-    return sendBatch(authInstance, requests); // retry
+    return sendBatch(authInstance, requests, attempt + 1);
+  }
+
+  // Batch-level 503/504 — server overloaded, exponential backoff
+  if ((response.status === 503 || response.status === 504) && attempt <= MAX_ATTEMPTS) {
+    await sleep(2000 * Math.pow(2, attempt - 1));
+    return sendBatch(authInstance, requests, attempt + 1);
+  }
+
+  const responses = response.data?.responses || [];
+
+  // Empty responses = batch was throttled at Exchange level but returned 200
+  // This causes all individual requests to appear as "undefined" in results
+  if (responses.length === 0 && requests.length > 0 && attempt <= MAX_ATTEMPTS) {
+    const backoff = 3000 * attempt; // 3s, 6s, 9s...
+    await sleep(backoff);
+    return sendBatch(authInstance, requests, attempt + 1);
   }
 
   const results = {};
-  for (const r of (response.data?.responses || [])) {
+  for (const r of responses) {
     results[r.id] = { status: r.status, body: r.body };
   }
   return results;
@@ -241,22 +261,22 @@ async function fixFolder(srcClient, tgtClient, srcAuth, tgtAuth, srcEmail, tgtEm
 
   for (let i = 0; i < deleteChunks.length; i++) {
     const batch = deleteChunks[i];
-    // Use message ID as batch request ID — guarantees unique mapping across chunks
-    const requests = batch.map(e => ({
-      id: e.draft.id,
+    // Use short numeric index as batch ID — Graph API has issues with long Exchange IDs as batch IDs
+    const requests = batch.map((e, idx) => ({
+      id: String(idx),
       method: 'DELETE',
       url: `/users/${tgtEmail}/messages/${e.draft.id}`
     }));
 
     const results = await sendBatch(tgtAuth, requests);
 
-    for (const e of batch) {
-      const r = results[e.draft.id];
+    batch.forEach((e, idx) => {
+      const r = results[String(idx)];
       if (r && r.status === 204) {
         deleted.add(e.draft.id);
       }
-      // 404 = already gone from previous run — skip silently (no warning, not an error)
-    }
+      // 404 = already gone from previous run — skip silently
+    });
 
     const progress = Math.min((i + 1) * BATCH_SIZE, drafts.length);
     logger.info(`   🗑️  [${progress}/${drafts.length}] ${Math.round(progress/drafts.length*100)}% — batch ${i+1}/${deleteChunks.length}`);
@@ -277,16 +297,19 @@ async function fixFolder(srcClient, tgtClient, srcAuth, tgtAuth, srcEmail, tgtEm
   logger.info(`   ✉️  Phase 3/3: Batch creating ${toCreate.length} messages (${BATCH_SIZE}/batch)...`);
   let created = 0, failed = 0;
   const createChunks = chunk(toCreate, BATCH_SIZE);
+  const QUOTA_RETRY_WAIT_MS = 60000; // 60s pause when quota hit, then retry same batch
+  const MAX_BATCH_RETRIES   = 3;
 
   for (let i = 0; i < createChunks.length; i++) {
     const batch = createChunks[i];
-    // Use source draft ID as batch request ID — unique per message
-    const requests = batch.map(e => {
+
+    // Build requests helper — called again on retry
+    const buildRequests = () => batch.map((e, idx) => {
       const payload = e.original
         ? buildPayload(e.original, e.original.id, true)
         : buildPayload(e.draft, null, false);
       return {
-        id: e.draft.id,
+        id: String(idx),
         method: 'POST',
         url: `/users/${tgtEmail}/mailFolders/${tgtFolderId}/messages`,
         headers: { 'Content-Type': 'application/json' },
@@ -294,19 +317,37 @@ async function fixFolder(srcClient, tgtClient, srcAuth, tgtAuth, srcEmail, tgtEm
       };
     });
 
-    const results = await sendBatch(tgtAuth, requests);
+    // Send with retry on quota errors
+    let results = {};
+    for (let attempt = 0; attempt <= MAX_BATCH_RETRIES; attempt++) {
+      results = await sendBatch(tgtAuth, buildRequests());
+
+      // Check if quota hit on any item in this batch
+      const hasQuotaError = batch.some((e, idx) => {
+        const r = results[String(idx)];
+        const msg = r?.body?.error?.message || '';
+        return !r || msg.includes('Request limit') || msg.includes('MailboxConcurrency');
+      });
+
+      if (!hasQuotaError) break; // success — no retry needed
+
+      if (attempt < MAX_BATCH_RETRIES) {
+        logger.warn(`   ⏸️  Quota hit on batch ${i+1} — pausing 60s and retrying (attempt ${attempt+1}/${MAX_BATCH_RETRIES})...`);
+        await sleep(QUOTA_RETRY_WAIT_MS);
+      }
+    }
 
     let batchCreated = 0;
-    for (const e of batch) {
-      const r = results[e.draft.id];
+    for (let idx = 0; idx < batch.length; idx++) {
+      const e = batch[idx];
+      const r = results[String(idx)];
       if (r && r.status === 201) {
         created++;
         batchCreated++;
       } else {
-        const errMsg = r?.body?.error?.message || `status ${r?.status}`;
-        // Retry-able errors — will be picked up on next run
-        if (errMsg.includes('Request limit') || errMsg.includes('MailboxConcurrency')) {
-          logger.warn(`   ⚠️  Quota hit on "${e.draft.subject}" — will retry on next run`);
+        const errMsg = r?.body?.error?.message || (r ? `status ${r.status}` : 'no response from batch');
+        if (!r || errMsg.includes('Request limit') || errMsg.includes('MailboxConcurrency')) {
+          logger.warn(`   ⚠️  Quota persists for "${e.draft.subject}" after ${MAX_BATCH_RETRIES} retries — next run will fix`);
         } else {
           logger.error(`   ✗ Create failed "${e.draft.subject}": ${errMsg}`);
         }
@@ -320,9 +361,8 @@ async function fixFolder(srcClient, tgtClient, srcAuth, tgtAuth, srcEmail, tgtEm
     // Pause between batches to avoid MailboxConcurrency and Request limit errors
     if (i < createChunks.length - 1) {
       if ((i + 1) % BATCH_PAUSE_EVERY === 0) {
-        // Every 10 batches (200 msgs), pause longer to let Exchange breathe
-        logger.info(`   ⏸️  Pausing 5s after ${(i+1) * BATCH_SIZE} messages...`);
-        await sleep(5000);
+        logger.info(`   ⏸️  Pausing 8s after ${(i+1) * BATCH_SIZE} messages...`);
+        await sleep(8000);
       } else {
         await sleep(BATCH_DELAY_MS);
       }
@@ -375,13 +415,20 @@ async function processUser(srcClient, tgtClient, srcAuth, tgtAuth, user, logger)
     }
     if (!tgtFolderId) continue;
 
+    const beforeFixed = stats.fixed + stats.failed;
     await fixFolder(
       srcClient, tgtClient, srcAuth, tgtAuth,
       user.sourceEmail, user.targetEmail,
       srcFolder, tgtFolderId,
       logger, stats
     );
-    totalDrafts += stats.fixed + stats.failed;
+    const processedInFolder = (stats.fixed + stats.failed) - beforeFixed;
+    totalDrafts += processedInFolder;
+
+    // Wait between folders to let Exchange quota recover
+    if (processedInFolder > 0) {
+      await sleep(5000);
+    }
   }
 
   if (totalDrafts === 0) logger.info('   ✅ No drafts found — nothing to fix!');
@@ -422,7 +469,8 @@ async function main() {
 
   const globalStats = { fixed: 0, failed: 0 };
 
-  for (const user of users) {
+  for (let i = 0; i < users.length; i++) {
+    const user = users[i];
     const logger = new Logger(config.logs_dir || './logs', user.sourceEmail);
     try {
       const s = await processUser(srcClient, tgtClient, srcAuth, tgtAuth, user, logger);
@@ -430,6 +478,12 @@ async function main() {
       globalStats.failed += s.failed;
     } catch (err) {
       logger.error(`Fatal error for ${user.sourceEmail}: ${err.message}`);
+    }
+
+    // Wait between users to let Exchange quota recover
+    if (i < users.length - 1) {
+      mainLogger.info(`   ⏳ Waiting 60s before next user (quota recovery)...`);
+      await sleep(60000);
     }
   }
 
