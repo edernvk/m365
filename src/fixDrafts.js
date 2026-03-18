@@ -46,9 +46,9 @@ const ONLY_USER  = argv.user || argv.u || null;
 const DRY_RUN    = argv['dry-run'] || argv.d || false;
 const BATCH_SIZE = Math.min(parseInt(argv['batch-size'] || '20', 10), 20); // Graph max is 20
 const PAGE_SIZE  = 100;
-const PHASE_DELAY_MS    = 2000; // wait after bulk delete before recreating
-const BATCH_DELAY_MS    = 2000; // delay between create batches — prevents MailboxConcurrency limit
-const BATCH_PAUSE_EVERY = 3;    // pause longer every N batches to let Exchange breathe
+const PHASE_DELAY_MS    = 1500; // wait after bulk delete before recreating
+const BATCH_DELAY_MS    = 1000; // delay between create batches — prevents MailboxConcurrency limit
+const BATCH_PAUSE_EVERY = 5;    // pause longer every N batches to let Exchange breathe
 
 const WELL_KNOWN = {
   'Caixa de Entrada': 'inbox',       'Inbox': 'inbox',
@@ -238,7 +238,7 @@ async function fixFolder(srcClient, tgtClient, srcAuth, tgtAuth, srcEmail, tgtEm
   // ── PHASE 1: Fetch originals from source (concurrency 3) ───────────────
   // 3 concurrent reads against source tenant — safe within 4 concurrent/app/mailbox limit
   logger.info(`   ⬇️  Phase 1/3: Fetching ${drafts.length} originals from source (concurrency 3)...`);
-  const fetchLimit = pLimit(4); // 4 = documented max concurrent requests per app per mailbox (Graph API)
+  const fetchLimit = pLimit(8); // 8 concurrent reads against source — reads are lightweight
   let fetchCount = 0;
   const enriched = await Promise.all(
     drafts.map(draft => fetchLimit(async () => {
@@ -361,8 +361,8 @@ async function fixFolder(srcClient, tgtClient, srcAuth, tgtAuth, srcEmail, tgtEm
     // Pause between batches to avoid MailboxConcurrency and Request limit errors
     if (i < createChunks.length - 1) {
       if ((i + 1) % BATCH_PAUSE_EVERY === 0) {
-        logger.info(`   ⏸️  Pausing 8s after ${(i+1) * BATCH_SIZE} messages...`);
-        await sleep(8000);
+        logger.info(`   ⏸️  Pausing 5s after ${(i+1) * BATCH_SIZE} messages...`);
+        await sleep(5000);
       } else {
         await sleep(BATCH_DELAY_MS);
       }
@@ -399,21 +399,40 @@ async function processUser(srcClient, tgtClient, srcAuth, tgtAuth, user, logger)
       for (const c of f.childFolders) tgtFolderMap[c.displayName] = c.id;
     }
   }
-  logger.info(`   ✓ ${srcFolders.length} source folders, ${Object.keys(tgtFolderMap).length} target folders`);
 
+  // CRITICAL: resolve well-known folders and OVERRIDE map entries.
+  // Migration puts emails in well-known folders (e.g. "sentitems"), but target may
+  // also have custom folders with the same Portuguese name ("Itens Enviados").
+  // Without this, fixDrafts checks the empty custom folder instead of the real one.
+  const wellKnownResolved = {};  // wkId → real folder id
+  for (const [name, wkId] of Object.entries(WELL_KNOWN)) {
+    if (wellKnownResolved[wkId]) {
+      // Already resolved this well-known ID — just map the alias name
+      tgtFolderMap[name] = wellKnownResolved[wkId];
+      continue;
+    }
+    try {
+      const f = await tgtClient.get(`/users/${user.targetEmail}/mailFolders/${wkId}`);
+      wellKnownResolved[wkId] = f.id;
+      tgtFolderMap[name] = f.id;             // "Itens Enviados" → real ID
+      tgtFolderMap[f.displayName] = f.id;    // "Sent Items" → real ID
+    } catch (e) { /* folder doesn't exist — skip */ }
+  }
+
+  logger.info(`   ✓ ${srcFolders.length} source folders, ${Object.keys(tgtFolderMap).length} target folders (${Object.keys(wellKnownResolved).length} well-known resolved)`);
+
+  // Track which target folder IDs we've already checked (avoid double-checking)
+  const checkedFolderIds = new Set();
   let totalDrafts = 0;
 
   for (const srcFolder of srcFolders) {
-    // Find matching target folder — use map first, then well-known fallback
+    // Find matching target folder
     let tgtFolderId = tgtFolderMap[srcFolder.displayName];
-    if (!tgtFolderId && WELL_KNOWN[srcFolder.displayName]) {
-      try {
-        const f = await tgtClient.get(`/users/${user.targetEmail}/mailFolders/${WELL_KNOWN[srcFolder.displayName]}`);
-        tgtFolderId = f.id;
-        tgtFolderMap[srcFolder.displayName] = tgtFolderId; // cache it
-      } catch (e) { continue; }
-    }
     if (!tgtFolderId) continue;
+
+    // Skip if already checked (well-known aliases may point to same folder)
+    if (checkedFolderIds.has(tgtFolderId)) continue;
+    checkedFolderIds.add(tgtFolderId);
 
     const beforeFixed = stats.fixed + stats.failed;
     await fixFolder(
@@ -427,7 +446,7 @@ async function processUser(srcClient, tgtClient, srcAuth, tgtAuth, user, logger)
 
     // Wait between folders to let Exchange quota recover
     if (processedInFolder > 0) {
-      await sleep(5000);
+      await sleep(3000);
     }
   }
 
@@ -482,8 +501,8 @@ async function main() {
 
     // Wait between users to let Exchange quota recover
     if (i < users.length - 1) {
-      mainLogger.info(`   ⏳ Waiting 60s before next user (quota recovery)...`);
-      await sleep(60000);
+      mainLogger.info(`   ⏳ Waiting 30s before next user (quota recovery)...`);
+      await sleep(30000);
     }
   }
 

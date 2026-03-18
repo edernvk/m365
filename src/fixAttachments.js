@@ -57,7 +57,23 @@ const USER_DELAY_MS       = 60000;
 const QUOTA_RETRY_WAIT_MS = 60000;
 const MAX_BATCH_RETRIES   = 3;
 
+// Well-known folder mapping (same as emailMigrator/fixDrafts)
+const WELL_KNOWN = {
+  'Caixa de Entrada': 'inbox',       'Inbox': 'inbox',
+  'Itens Enviados':   'sentitems',   'Sent Items': 'sentitems',
+  'Itens Excluídos':  'deleteditems','Deleted Items': 'deleteditems',
+  'Rascunhos':        'drafts',      'Drafts': 'drafts',
+  'Lixo Eletrônico':  'junkemail',   'Junk Email': 'junkemail',
+  'Arquivo Morto':    'archive',     'Archive': 'archive',
+};
+
 const DRY_RUN = process.argv.includes('--dry-run');
+const ONLY_USER = (() => {
+  const idx = process.argv.indexOf('--user');
+  if (idx !== -1 && process.argv[idx + 1]) return process.argv[idx + 1];
+  const eq = process.argv.find(a => a.startsWith('--user='));
+  return eq ? eq.split('=')[1] : null;
+})();
 
 // ── Config ────────────────────────────────────────────────────────────────────
 let config;
@@ -118,7 +134,8 @@ function buildPayload(msg, sourceId) {
 }
 
 // ── JSON Batch ────────────────────────────────────────────────────────────────
-async function sendBatch(authInstance, requests) {
+async function sendBatch(authInstance, requests, attempt = 1) {
+  const MAX_ATTEMPTS = 5;
   const token = await authInstance.getToken();
   const response = await axios.post(
     GRAPH_BATCH_URL,
@@ -131,10 +148,21 @@ async function sendBatch(authInstance, requests) {
   if (response.status === 429) {
     const wait = parseInt(response.headers['retry-after'] || '10') * 1000;
     await sleep(wait);
-    return sendBatch(authInstance, requests);
+    return sendBatch(authInstance, requests, attempt + 1);
+  }
+  // 503/504 — server overloaded, exponential backoff
+  if ((response.status === 503 || response.status === 504) && attempt <= MAX_ATTEMPTS) {
+    await sleep(2000 * Math.pow(2, attempt - 1));
+    return sendBatch(authInstance, requests, attempt + 1);
+  }
+  const responses = response.data?.responses || [];
+  // Empty responses = batch throttled at Exchange level but returned 200
+  if (responses.length === 0 && requests.length > 0 && attempt <= MAX_ATTEMPTS) {
+    await sleep(3000 * attempt);
+    return sendBatch(authInstance, requests, attempt + 1);
   }
   const results = {};
-  for (const r of (response.data?.responses || [])) {
+  for (const r of responses) {
     results[r.id] = { status: r.status, body: r.body };
   }
   return results;
@@ -364,22 +392,38 @@ async function uploadLargeAttachment(tgtAuth, tgtEmail, messageId, attachment, l
   const totalSize = actualSize;  // already decoded above
   const chunkSize = 4 * 1024 * 1024;
 
-  // If file fits in one chunk, send in a single PUT
+  // If file fits in one chunk, send in a single PUT (with retry for transient errors)
   if (totalSize <= chunkSize) {
-    const resp = await axios.put(uploadUrl, fileBytes, {
-      headers: {
-        'Content-Type':   'application/octet-stream',
-        'Content-Length': String(totalSize),
-        'Content-Range':  `bytes 0-${totalSize - 1}/${totalSize}`
-      },
-      validateStatus: null,
-      maxBodyLength: Infinity
-    });
-    if (resp.status !== 200 && resp.status !== 201 && resp.status !== 202) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const resp = await axios.put(uploadUrl, fileBytes, {
+        headers: {
+          'Content-Type':   'application/octet-stream',
+          'Content-Length': String(totalSize),
+          'Content-Range':  `bytes 0-${totalSize - 1}/${totalSize}`
+        },
+        validateStatus: null,
+        maxBodyLength: Infinity
+      });
+      if (resp.status === 200 || resp.status === 201 || resp.status === 202) {
+        return; // success
+      }
       const errMsg = resp.data?.error?.message || JSON.stringify(resp.data) || `HTTP ${resp.status}`;
-      throw new Error(`Single chunk upload failed: ${errMsg}`);
+      const isRetryable = resp.status === 429 || resp.status === 503 || resp.status === 504
+        || errMsg.includes('change key') || errMsg.includes('changeKey')
+        || errMsg.includes('IncomingBytes') || errMsg.includes('quota');
+
+      if (isRetryable && attempt < 2) {
+        const wait = resp.status === 429
+          ? parseInt(resp.headers?.['retry-after'] || '15') * 1000
+          : errMsg.includes('IncomingBytes') || errMsg.includes('quota')
+            ? 60000   // quota: wait 60s
+            : 10000;  // changeKey: wait 10s
+        if (logger) logger.warn(`   ⏸️  Single chunk retry "${attachment.name}": ${errMsg} — waiting ${wait/1000}s (attempt ${attempt+1}/3)`);
+        await sleep(wait);
+      } else {
+        throw new Error(`Single chunk upload failed: ${errMsg}`);
+      }
     }
-    return;
   }
 
   // Multi-chunk upload — retry each chunk up to 3x on transient errors
@@ -412,8 +456,10 @@ async function uploadLargeAttachment(tgtAuth, tgtEmail, messageId, attachment, l
 
       if (isRetryable && attempt < 2) {
         const wait = resp.status === 429
-          ? parseInt(resp.headers?.['retry-after'] || '10') * 1000
-          : 5000;
+          ? parseInt(resp.headers?.['retry-after'] || '15') * 1000
+          : errMsg.includes('IncomingBytes') || errMsg.includes('quota')
+            ? 60000   // quota: wait 60s
+            : 10000;  // changeKey/503/504: wait 10s
         await sleep(wait);
       } else {
         throw new Error(`Chunk upload failed at offset ${offset}: ${errMsg}`);
@@ -598,22 +644,37 @@ async function fixFolder(srcClient, tgtClient, srcAuth, tgtAuth,
     let chunkCreated = 0, chunkFailed = 0;
 
     for (const e of mustSingle) {
-      try {
-        const token = await tgtAuth.getToken();
-        const resp  = await require('axios').post(`${GRAPH_BASE}/users/${tgtEmail}/mailFolders/${tgtFolderId}/messages`, buildMsgPayload(e),
-          { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }, validateStatus: null });
-        if (resp.status === 201) {
-          chunkCreated++;
-          if (resp.data?.id) for (const att of e.attachments.filter(a => a.size > ATTACHMENT_INLINE_LIMIT))
-            try { await uploadLargeAttachment(tgtAuth, tgtEmail, resp.data.id, att, logger); }
-            catch (err) { logger.error(`   ✗ Large att "${att.name}": ${err.message}`); }
-        } else { logger.error(`   ✗ "${e.srcMsg.subject}": ${resp.data?.error?.message || resp.status}`); chunkFailed++; }
-      } catch (err) { logger.error(`   ✗ "${e.srcMsg.subject}": ${err.message}`); chunkFailed++; }
-      await sleep(300);
+      let singleOk = false;
+      for (let attempt = 0; attempt <= MAX_BATCH_RETRIES; attempt++) {
+        try {
+          const token = await tgtAuth.getToken();
+          const resp  = await require('axios').post(`${GRAPH_BASE}/users/${tgtEmail}/mailFolders/${tgtFolderId}/messages`, buildMsgPayload(e),
+            { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }, validateStatus: null });
+          if (resp.status === 201) {
+            chunkCreated++;
+            singleOk = true;
+            if (resp.data?.id) for (const att of e.attachments.filter(a => a.size > ATTACHMENT_INLINE_LIMIT))
+              try { await uploadLargeAttachment(tgtAuth, tgtEmail, resp.data.id, att, logger); }
+              catch (err) { logger.error(`   ✗ Large att "${att.name}": ${err.message}`); }
+            break;
+          }
+          const errMsg = resp.data?.error?.message || `HTTP ${resp.status}`;
+          if ((errMsg.includes('IncomingBytes') || errMsg.includes('Request limit') || errMsg.includes('MailboxConcurrency')) && attempt < MAX_BATCH_RETRIES) {
+            logger.warn(`   ⏸️  IncomingBytes/quota on "${e.srcMsg.subject}" — pausing 120s (attempt ${attempt+1}/${MAX_BATCH_RETRIES})...`);
+            await sleep(120000); // 120s — IncomingBytes quota resets slower
+          } else {
+            logger.error(`   ✗ "${e.srcMsg.subject}": ${errMsg}`);
+            chunkFailed++;
+            break;
+          }
+        } catch (err) { logger.error(`   ✗ "${e.srcMsg.subject}": ${err.message}`); chunkFailed++; break; }
+      }
+      await sleep(500);
     }
 
-    for (let bi = 0; bi < chunk(canBatch, BATCH_SIZE).length; bi++) {
-      const batch = chunk(canBatch, BATCH_SIZE)[bi];
+    const canBatchChunks = chunk(canBatch, BATCH_SIZE);
+    for (let bi = 0; bi < canBatchChunks.length; bi++) {
+      const batch = canBatchChunks[bi];
       const buildReqs = () => batch.map((e, idx) => ({ id: String(idx), method: 'POST', url: `/users/${tgtEmail}/mailFolders/${tgtFolderId}/messages`, headers: { 'Content-Type': 'application/json' }, body: buildMsgPayload(e) }));
       let results = {};
       for (let attempt = 0; attempt <= MAX_BATCH_RETRIES; attempt++) {
@@ -637,7 +698,7 @@ async function fixFolder(srcClient, tgtClient, srcAuth, tgtAuth,
           chunkFailed++;
         }
       }
-      if (bi < chunk(canBatch, BATCH_SIZE).length - 1) {
+      if (bi < canBatchChunks.length - 1) {
         if ((bi + 1) % BATCH_PAUSE_EVERY === 0) await sleep(8000); else await sleep(BATCH_DELAY_MS);
       }
     }
@@ -679,13 +740,38 @@ async function processUser(srcClient, tgtClient, srcAuth, tgtAuth, user, logger)
     for (const c of (f.childFolders || [])) tgtFolderMap.set(c.displayName.toLowerCase(), c.id);
   }
 
+  // CRITICAL: resolve well-known folders and OVERRIDE map entries.
+  // Migration puts emails in well-known folders (e.g. "sentitems"), but target may
+  // also have custom folders with the same Portuguese name ("Itens Enviados").
+  // Without this, fixAttachments checks the empty custom folder instead of the real one.
+  const wellKnownResolved = {};
+  for (const [name, wkId] of Object.entries(WELL_KNOWN)) {
+    if (wellKnownResolved[wkId]) {
+      tgtFolderMap.set(name.toLowerCase(), wellKnownResolved[wkId]);
+      continue;
+    }
+    try {
+      const f = await tgtClient.get(`/users/${user.targetEmail}/mailFolders/${wkId}`);
+      wellKnownResolved[wkId] = f.id;
+      tgtFolderMap.set(name.toLowerCase(), f.id);
+      tgtFolderMap.set(f.displayName.toLowerCase(), f.id);
+    } catch (e) { /* folder doesn't exist — skip */ }
+  }
+
   const srcFolders = [...srcFolderMap.values()];
-  logger.info(`   ✓ ${srcFolders.length} source folders, ${tgtFolderMap.size} target folders`);
+  logger.info(`   ✓ ${srcFolders.length} source folders, ${tgtFolderMap.size} target folders (${Object.keys(wellKnownResolved).length} well-known resolved)`);
+
+  // Track checked target folder IDs to avoid double-checking
+  const checkedFolderIds = new Set();
 
   for (let fi = 0; fi < srcFolders.length; fi++) {
     const srcFolder  = srcFolders[fi];
     const tgtFolderId = tgtFolderMap.get(srcFolder.displayName.toLowerCase());
     if (!tgtFolderId) continue; // not migrated yet
+
+    // Skip if already checked (well-known aliases may point to same folder)
+    if (checkedFolderIds.has(tgtFolderId)) continue;
+    checkedFolderIds.add(tgtFolderId);
 
     const before = stats.fixed + stats.failed;
     await fixFolder(
@@ -711,8 +797,12 @@ async function main() {
   mainLogger.info(`   Target: ${config.target_tenant.domain}`);
 
   const userLoader = new UserLoader(config.users_csv);
-  const users      = userLoader.load();
-  mainLogger.info(`   Users: ${users.length}`);
+  let users        = userLoader.load();
+  if (ONLY_USER) {
+    users = users.filter(u => u.sourceEmail.toLowerCase() === ONLY_USER.toLowerCase());
+    if (!users.length) { mainLogger.error(`User not found: ${ONLY_USER}`); process.exit(1); }
+  }
+  mainLogger.info(`   Users: ${users.length}${ONLY_USER ? ` (filtered: ${ONLY_USER})` : ''}`);
 
   const srcAuth = new TenantAuth(config.source_tenant, 'source');
   await srcAuth.getToken();

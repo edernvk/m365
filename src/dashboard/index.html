@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>M365 Email Migrator</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f1117; color: #e1e4e8; min-height: 100vh; }
+    #root { max-width: 1300px; margin: 0 auto; padding: 20px; }
+
+    .header { display: flex; align-items: center; gap: 16px; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid #21262d; }
+    .header h1 { font-size: 22px; font-weight: 600; }
+    .header h1 span { color: #58a6ff; }
+    .status-dot { width: 10px; height: 10px; border-radius: 50%; background: #484f58; flex-shrink: 0; }
+    .status-dot.running { background: #3fb950; animation: pulse 1.5s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1}50%{opacity:.4} }
+
+    .btn { padding: 8px 16px; border: 1px solid #30363d; border-radius: 6px; background: #21262d; color: #e1e4e8; cursor: pointer; font-size: 13px; font-weight: 500; transition: all .15s; display: inline-flex; align-items: center; gap: 6px; }
+    .btn:hover { background: #30363d; border-color: #58a6ff; }
+    .btn:disabled { opacity: .35; cursor: not-allowed; }
+    .btn.primary { background: #238636; border-color: #238636; color: #fff; }
+    .btn.primary:hover { background: #2ea043; }
+    .btn.danger { background: #da3633; border-color: #da3633; color: #fff; }
+    .btn.danger:hover { background: #f85149; }
+    .btn.sm { padding: 4px 10px; font-size: 12px; }
+    .btn.outline { background: transparent; }
+
+    .panel { background: #161b22; border: 1px solid #21262d; border-radius: 10px; margin-bottom: 20px; overflow: hidden; }
+    .panel-header { padding: 12px 16px; background: #1c2129; border-bottom: 1px solid #21262d; font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; color: #8b949e; display: flex; justify-content: space-between; align-items: center; }
+
+    table { width: 100%; border-collapse: collapse; }
+    th { padding: 10px 16px; text-align: left; font-size: 11px; color: #8b949e; font-weight: 600; text-transform: uppercase; border-bottom: 1px solid #21262d; }
+    td { padding: 10px 16px; font-size: 13px; border-bottom: 1px solid #21262d; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover { background: #1c2129; }
+    tr.selected { background: rgba(88,166,255,.08); }
+
+    .badge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+    .badge.idle { background: #21262d; color: #8b949e; }
+    .badge.queued { background: #1c2333; color: #58a6ff; }
+    .badge.running { background: #0d2818; color: #3fb950; }
+    .badge.done { background: #0a3622; color: #56d364; }
+    .badge.error { background: #3d1114; color: #f85149; }
+    .badge.cancelled { background: #2a1f00; color: #d29922; }
+
+    .progress-bar { width: 100%; height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; }
+    .progress-fill { height: 100%; background: #3fb950; border-radius: 3px; transition: width .3s; }
+
+    .log-container { max-height: 350px; overflow-y: auto; padding: 8px 0; font-family: 'Cascadia Code','Fira Code',monospace; font-size: 12px; line-height: 1.6; }
+    .log-line { padding: 1px 16px; white-space: pre-wrap; word-break: break-all; }
+    .log-line.error { color: #f85149; background: rgba(248,81,73,.05); }
+    .log-line.warn { color: #d29922; }
+    .log-line.success { color: #3fb950; }
+
+    .add-form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid #21262d; }
+    .add-form input { flex: 1; padding: 8px 12px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #e1e4e8; font-size: 13px; }
+    .add-form input::placeholder { color: #484f58; }
+    .add-form input:focus { outline: none; border-color: #58a6ff; }
+
+    .layout { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    @media(max-width:900px) { .layout { grid-template-columns: 1fr; } }
+
+    .tabs { display: flex; gap: 0; margin-bottom: 20px; }
+    .tab { padding: 8px 20px; background: transparent; border: 1px solid #21262d; color: #8b949e; cursor: pointer; font-size: 13px; font-weight: 500; }
+    .tab:first-child { border-radius: 8px 0 0 8px; }
+    .tab:last-child { border-radius: 0 8px 8px 0; }
+    .tab:not(:last-child) { border-right: none; }
+    .tab.active { background: #21262d; color: #e1e4e8; border-color: #58a6ff; }
+
+    .checkbox { width: 16px; height: 16px; accent-color: #58a6ff; cursor: pointer; }
+    .btn-icon { background: transparent; border: none; color: #484f58; cursor: pointer; padding: 4px 6px; border-radius: 4px; font-size: 14px; }
+    .btn-icon:hover { color: #f85149; background: rgba(248,81,73,.1); }
+    .btn-icon.blue:hover { color: #58a6ff; background: rgba(88,166,255,.1); }
+
+    .empty { text-align: center; color: #484f58; padding: 40px 20px; font-size: 13px; }
+
+    /* Modal */
+    .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 100; display: flex; align-items: center; justify-content: center; }
+    .modal { width: 90%; max-width: 900px; max-height: 80vh; background: #161b22; border: 1px solid #30363d; border-radius: 12px; overflow: hidden; }
+    .modal .log-container { max-height: calc(80vh - 50px); }
+
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+
+    .task-picker { display: flex; gap: 10px; padding: 16px; }
+    .task-card { flex: 1; padding: 16px; border: 2px solid #21262d; border-radius: 10px; cursor: pointer; text-align: center; transition: all .15s; }
+    .task-card:hover { border-color: #30363d; background: #1c2129; }
+    .task-card.active { border-color: #58a6ff; background: rgba(88,166,255,.06); }
+    .task-card .icon { font-size: 28px; margin-bottom: 6px; }
+    .task-card .label { font-size: 13px; font-weight: 600; }
+    .task-card .desc { font-size: 11px; color: #8b949e; margin-top: 4px; }
+    .task-card:hover .label { color: #58a6ff; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    const TASKS = {
+      'migrate':         { icon: '📧', label: 'Migrar Emails',      desc: 'Migra caixa de entrada completa' },
+      'fix-drafts':      { icon: '📝', label: 'Corrigir Rascunhos', desc: 'Remove flag de rascunho' },
+      'fix-attachments': { icon: '📎', label: 'Corrigir Anexos',    desc: 'Reanexa arquivos faltantes' },
+    };
+
+    function App() {
+      // Data
+      const [users, setUsers]         = useState([]);
+      const [selected, setSelected]   = useState(new Set()); // selected sourceEmails
+      const [queue, setQueue]         = useState([]);         // queued sourceEmails
+      const [task, setTask]           = useState('migrate');  // selected task type
+      const [tab, setTab]             = useState('setup');    // setup | running | log
+
+      // Job state (from SSE)
+      const [job, setJob]             = useState(null);       // active job
+      const [userResults, setUserResults] = useState({});     // email -> {status, fixed, failed}
+      const [currentUser, setCurrentUser] = useState(null);
+      const [currentFolder, setCurrentFolder] = useState('');
+      const [progress, setProgress]   = useState({ current: 0, total: 0, percent: 0 });
+      const [logs, setLogs]           = useState([]);
+
+      // User management
+      const [newSource, setNewSource] = useState('');
+      const [newTarget, setNewTarget] = useState('');
+      const [newName, setNewName]     = useState('');
+      const [userLog, setUserLog]     = useState(null);
+      const [userLogLines, setUserLogLines] = useState([]);
+
+      const logRef = useRef(null);
+
+      // ── Load users ─────────────────────────────────────────────────────
+      const loadUsers = useCallback(async () => {
+        try {
+          const r = await fetch('/api/users');
+          const d = await r.json();
+          setUsers(d.users || []);
+        } catch {}
+      }, []);
+      useEffect(() => { loadUsers(); }, [loadUsers]);
+
+      // ── SSE ────────────────────────────────────────────────────────────
+      useEffect(() => {
+        const es = new EventSource('/api/events');
+
+        es.addEventListener('connected', (e) => {
+          const data = JSON.parse(e.data);
+          if (data.activeJob) {
+            setJob(data.activeJob);
+            setQueue(data.activeJob.users);
+            setUserResults(data.activeJob.userResults || {});
+            setCurrentUser(data.activeJob.currentUser);
+            setTab('running');
+          }
+        });
+
+        es.addEventListener('event', (e) => {
+          const ev = JSON.parse(e.data);
+          if (ev.raw) setLogs(prev => [...prev.slice(-299), ev.raw]);
+
+          switch (ev.type) {
+            case 'user_start':
+              setCurrentUser(ev.sourceEmail);
+              setCurrentFolder('');
+              setProgress({ current: 0, total: 0, percent: 0 });
+              break;
+            case 'folder_start':
+              setCurrentFolder(ev.folder);
+              break;
+            case 'loading_folders':
+              setCurrentFolder('Carregando pastas...');
+              break;
+            case 'folders_loaded':
+              setCurrentFolder(`${ev.sourceFolders} pastas`);
+              break;
+            case 'progress':
+              setProgress({ current: ev.current, total: ev.total, percent: ev.percent });
+              break;
+            case 'chunk':
+              setProgress(p => ({ ...p, percent: Math.round((ev.chunk / ev.chunkTotal) * 100) }));
+              break;
+          }
+        });
+
+        es.addEventListener('job', (e) => {
+          const ev = JSON.parse(e.data);
+          switch (ev.type) {
+            case 'job_start':
+              setJob(ev);
+              setTab('running');
+              setLogs([]);
+              break;
+            case 'user_running':
+              setUserResults(prev => ({ ...prev, [ev.email]: { status: 'running', fixed: 0, failed: 0 } }));
+              setCurrentUser(ev.email);
+              setCurrentFolder('');
+              setProgress({ current: 0, total: 0, percent: 0 });
+              break;
+            case 'user_finished':
+              setUserResults(prev => ({ ...prev, [ev.email]: { status: ev.status, fixed: ev.fixed, failed: ev.failed } }));
+              setCurrentFolder('');
+              setProgress({ current: 0, total: 0, percent: 0 });
+              break;
+            case 'job_finished':
+              setJob(null);
+              setCurrentUser(null);
+              break;
+          }
+        });
+
+        return () => es.close();
+      }, []);
+
+      // Auto-scroll
+      useEffect(() => {
+        if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+      }, [logs]);
+
+      // ── Actions ────────────────────────────────────────────────────────
+      const toggleSelect = (email) => {
+        setSelected(prev => {
+          const n = new Set(prev);
+          n.has(email) ? n.delete(email) : n.add(email);
+          return n;
+        });
+      };
+      const selectAll = () => {
+        if (selected.size === users.length) setSelected(new Set());
+        else setSelected(new Set(users.map(u => u.sourceEmail)));
+      };
+      const addToQueue = () => {
+        setQueue(prev => {
+          const set = new Set(prev);
+          for (const e of selected) set.add(e);
+          return [...set];
+        });
+        setSelected(new Set());
+      };
+      const removeFromQueue = (email) => {
+        setQueue(prev => prev.filter(e => e !== email));
+      };
+      const clearQueue = () => setQueue([]);
+
+      const startJob = async () => {
+        if (!queue.length) return alert('Fila vazia! Selecione usuarios primeiro.');
+        setUserResults({});
+        queue.forEach(e => setUserResults(prev => ({ ...prev, [e]: { status: 'queued' } })));
+
+        const resp = await fetch('/api/jobs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ task, users: queue })
+        });
+        if (!resp.ok) {
+          const d = await resp.json();
+          alert(d.error || 'Erro ao iniciar');
+        }
+      };
+
+      const cancelJob = async () => {
+        await fetch('/api/jobs/cancel', { method: 'POST' });
+      };
+
+      const addUser = async () => {
+        if (!newSource || !newTarget) return;
+        const r = await fetch('/api/users', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sourceEmail: newSource, targetEmail: newTarget, displayName: newName })
+        });
+        if (r.ok) { setNewSource(''); setNewTarget(''); setNewName(''); loadUsers(); }
+        else { const d = await r.json(); alert(d.error); }
+      };
+
+      const removeUser = async (email) => {
+        if (!confirm(`Remover ${email}?`)) return;
+        await fetch(`/api/users/${encodeURIComponent(email)}`, { method: 'DELETE' });
+        loadUsers();
+      };
+
+      const viewUserLog = async (email) => {
+        setUserLog(email);
+        try {
+          const r = await fetch(`/api/users/${encodeURIComponent(email)}/log?n=200`);
+          const d = await r.json();
+          setUserLogLines(d.lines || []);
+        } catch { setUserLogLines(['Erro ao carregar log']); }
+      };
+
+      const logClass = (l) => {
+        if (l.includes('[ERROR]') || l.includes('✗')) return 'error';
+        if (l.includes('[WARN]') || l.includes('⏸️')) return 'warn';
+        if (l.includes('[SUCCESS]') || l.includes('✓') || l.includes('✅')) return 'success';
+        return '';
+      };
+
+      // Progress for queue
+      const doneCount = Object.values(userResults).filter(r => r.status === 'done').length;
+      const queueTotal = queue.length;
+
+      return (
+        <div>
+          {/* Header */}
+          <div className="header">
+            <div className={`status-dot ${job ? 'running' : ''}`} />
+            <h1><span>M365</span> Email Migrator</h1>
+            {job && <span style={{fontSize:13,color:'#8b949e',marginLeft:'auto'}}>
+              {TASKS[job.task]?.icon} {TASKS[job.task]?.label} — {currentUser || '...'}
+              {currentFolder ? ` / ${currentFolder}` : ''}
+            </span>}
+          </div>
+
+          {/* Tabs */}
+          <div className="tabs">
+            <div className={`tab ${tab==='setup'?'active':''}`} onClick={()=>setTab('setup')}>
+              Configurar Job
+            </div>
+            <div className={`tab ${tab==='running'?'active':''}`} onClick={()=>setTab('running')}>
+              Execucao {job ? `(${doneCount}/${queueTotal})` : ''}
+            </div>
+            <div className={`tab ${tab==='log'?'active':''}`} onClick={()=>setTab('log')}>
+              Log
+            </div>
+            <div className={`tab ${tab==='users'?'active':''}`} onClick={()=>setTab('users')}>
+              Usuarios ({users.length})
+            </div>
+          </div>
+
+          {/* ── TAB: Setup ──────────────────────────────────────────── */}
+          {tab === 'setup' && (
+            <div>
+              {/* Task picker */}
+              <div className="panel">
+                <div className="panel-header">
+                  <span>1. Escolha a Tarefa</span>
+                </div>
+                <div className="task-picker">
+                  {Object.entries(TASKS).map(([key, t]) => (
+                    <div key={key} className={`task-card ${task===key?'active':''}`} onClick={()=>setTask(key)}>
+                      <div className="icon">{t.icon}</div>
+                      <div className="label">{t.label}</div>
+                      <div className="desc">{t.desc}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="layout">
+                {/* User selection */}
+                <div className="panel">
+                  <div className="panel-header">
+                    <span>2. Selecione Usuarios</span>
+                    <div style={{display:'flex',gap:8}}>
+                      <button className="btn sm outline" onClick={selectAll}>
+                        {selected.size === users.length ? 'Desmarcar' : 'Selecionar'} Todos
+                      </button>
+                      <button className="btn sm primary" onClick={addToQueue} disabled={!selected.size}>
+                        Adicionar a Fila ({selected.size})
+                      </button>
+                    </div>
+                  </div>
+                  <div style={{maxHeight:400,overflowY:'auto'}}>
+                    <table>
+                      <thead><tr><th style={{width:32}}></th><th>Usuario</th><th>Destino</th></tr></thead>
+                      <tbody>
+                        {users.map(u => (
+                          <tr key={u.sourceEmail} className={selected.has(u.sourceEmail)?'selected':''} onClick={()=>toggleSelect(u.sourceEmail)} style={{cursor:'pointer'}}>
+                            <td><input type="checkbox" className="checkbox" checked={selected.has(u.sourceEmail)} readOnly /></td>
+                            <td>
+                              <div style={{fontWeight:500}}>{u.displayName || u.sourceEmail.split('@')[0]}</div>
+                              <div style={{fontSize:11,color:'#8b949e'}}>{u.sourceEmail}</div>
+                            </td>
+                            <td style={{fontSize:12,color:'#8b949e'}}>{u.targetEmail}</td>
+                          </tr>
+                        ))}
+                        {!users.length && <tr><td colSpan="3" className="empty">Nenhum usuario. Va na aba Usuarios.</td></tr>}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                {/* Queue */}
+                <div className="panel">
+                  <div className="panel-header">
+                    <span>3. Fila de Execucao</span>
+                    <div style={{display:'flex',gap:8}}>
+                      {queue.length > 0 && <button className="btn sm outline" onClick={clearQueue}>Limpar</button>}
+                      <button className="btn sm primary" onClick={startJob} disabled={!queue.length || !!job}>
+                        ▶ Iniciar {TASKS[task].label}
+                      </button>
+                    </div>
+                  </div>
+                  <div style={{maxHeight:400,overflowY:'auto'}}>
+                    <table>
+                      <thead><tr><th>#</th><th>Usuario</th><th style={{width:40}}></th></tr></thead>
+                      <tbody>
+                        {queue.map((email, i) => {
+                          const u = users.find(x => x.sourceEmail === email);
+                          return (
+                            <tr key={email}>
+                              <td style={{color:'#8b949e',width:30}}>{i+1}</td>
+                              <td>
+                                <div style={{fontWeight:500}}>{u?.displayName || email.split('@')[0]}</div>
+                                <div style={{fontSize:11,color:'#8b949e'}}>{email}</div>
+                              </td>
+                              <td><button className="btn-icon" onClick={()=>removeFromQueue(email)} title="Remover">✕</button></td>
+                            </tr>
+                          );
+                        })}
+                        {!queue.length && <tr><td colSpan="3" className="empty">Selecione usuarios e adicione a fila</td></tr>}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ── TAB: Running ────────────────────────────────────────── */}
+          {tab === 'running' && (
+            <div>
+              {/* Global progress */}
+              {(job || Object.keys(userResults).length > 0) && (
+                <div style={{marginBottom:20}}>
+                  <div style={{display:'flex',justifyContent:'space-between',fontSize:12,color:'#8b949e',marginBottom:4}}>
+                    <span>{job ? `${TASKS[job.task]?.icon} ${TASKS[job.task]?.label}` : 'Job finalizado'}</span>
+                    <span>{doneCount}/{queueTotal} usuarios</span>
+                  </div>
+                  <div className="progress-bar" style={{height:8}}>
+                    <div className="progress-fill" style={{width:`${queueTotal?Math.round(doneCount/queueTotal*100):0}%`}} />
+                  </div>
+                  {job && (
+                    <div style={{marginTop:8,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                      <span style={{fontSize:12,color:'#8b949e'}}>
+                        {currentUser} {currentFolder ? `/ ${currentFolder}` : ''}
+                        {progress.total > 0 ? ` — ${progress.current}/${progress.total} (${progress.percent}%)` : ''}
+                      </span>
+                      <button className="btn sm danger" onClick={cancelJob}>✕ Cancelar</button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="panel">
+                <div className="panel-header">
+                  <span>Status por Usuario</span>
+                </div>
+                <table>
+                  <thead><tr><th>#</th><th>Usuario</th><th>Status</th><th style={{textAlign:'right'}}>Resultado</th><th></th></tr></thead>
+                  <tbody>
+                    {queue.map((email, i) => {
+                      const u = users.find(x => x.sourceEmail === email);
+                      const r = userResults[email] || { status: 'queued' };
+                      return (
+                        <tr key={email}>
+                          <td style={{color:'#8b949e',width:30}}>{i+1}</td>
+                          <td>
+                            <div style={{fontWeight:500}}>{u?.displayName || email.split('@')[0]}</div>
+                            <div style={{fontSize:11,color:'#8b949e'}}>{email}</div>
+                          </td>
+                          <td>
+                            <span className={`badge ${r.status}`}>
+                              {r.status === 'queued' && 'Na fila'}
+                              {r.status === 'running' && 'Rodando'}
+                              {r.status === 'done' && 'Concluido'}
+                              {r.status === 'error' && 'Erro'}
+                              {r.status === 'cancelled' && 'Cancelado'}
+                            </span>
+                          </td>
+                          <td style={{textAlign:'right',fontSize:12}}>
+                            {(r.status === 'done' || r.status === 'error') && (
+                              <span>
+                                <span style={{color:'#3fb950'}}>{r.fixed || 0} ok</span>
+                                {(r.failed || 0) > 0 && <span style={{color:'#f85149',marginLeft:8}}>{r.failed} erro</span>}
+                              </span>
+                            )}
+                          </td>
+                          <td><button className="btn-icon blue" onClick={()=>viewUserLog(email)} title="Ver log">&#128196;</button></td>
+                        </tr>
+                      );
+                    })}
+                    {!queue.length && <tr><td colSpan="5" className="empty">Nenhum job em execucao. Configure na aba anterior.</td></tr>}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* ── TAB: Log ────────────────────────────────────────────── */}
+          {tab === 'log' && (
+            <div className="panel">
+              <div className="panel-header">
+                <span>Log em Tempo Real</span>
+                <span style={{fontWeight:400,textTransform:'none'}}>{logs.length} linhas</span>
+              </div>
+              <div className="log-container" ref={logRef}>
+                {logs.map((line, i) => (
+                  <div key={i} className={`log-line ${logClass(line)}`}>{line}</div>
+                ))}
+                {!logs.length && <div className="empty">Inicie um job para ver os logs aqui.</div>}
+              </div>
+            </div>
+          )}
+
+          {/* ── TAB: Users ──────────────────────────────────────────── */}
+          {tab === 'users' && (
+            <div className="panel">
+              <div className="panel-header">
+                <span>Gerenciar Usuarios (users.csv)</span>
+                <span style={{fontWeight:400,textTransform:'none',color:'#58a6ff'}}>{users.length} usuarios</span>
+              </div>
+              <table>
+                <thead><tr><th>Source Email</th><th>Target Email</th><th>Nome</th><th style={{width:40}}></th></tr></thead>
+                <tbody>
+                  {users.map(u => (
+                    <tr key={u.sourceEmail}>
+                      <td>{u.sourceEmail}</td>
+                      <td>{u.targetEmail}</td>
+                      <td style={{color:u.displayName?'#e1e4e8':'#484f58'}}>{u.displayName||'-'}</td>
+                      <td><button className="btn-icon" onClick={()=>removeUser(u.sourceEmail)} title="Remover">✕</button></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="add-form">
+                <input placeholder="source@email.com" value={newSource} onChange={e=>setNewSource(e.target.value)} />
+                <input placeholder="target@email.com" value={newTarget} onChange={e=>setNewTarget(e.target.value)} />
+                <input placeholder="Nome (opcional)" value={newName} onChange={e=>setNewName(e.target.value)} style={{maxWidth:180}} />
+                <button className="btn primary" onClick={addUser} style={{flexShrink:0}}>+ Adicionar</button>
+              </div>
+            </div>
+          )}
+
+          {/* Modal: User log */}
+          {userLog && (
+            <div className="modal-bg" onClick={()=>setUserLog(null)}>
+              <div className="modal" onClick={e=>e.stopPropagation()}>
+                <div className="panel-header">
+                  <span>Log: {userLog}</span>
+                  <button className="btn-icon" onClick={()=>setUserLog(null)}>✕</button>
+                </div>
+                <div className="log-container" style={{maxHeight:'calc(80vh - 50px)'}}>
+                  {userLogLines.map((l,i) => <div key={i} className={`log-line ${logClass(l)}`}>{l}</div>)}
+                  {!userLogLines.length && <div className="empty">Nenhum log encontrado.</div>}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

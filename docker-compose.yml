@@ -51,3 +51,20 @@ services:
       - ./resume.json:/app/resume.json
     command: node src/status.js
     profiles: ["status"]
+
+  dashboard:
+    build: .
+    container_name: m365-email-dashboard
+    environment:
+      - TZ=America/Sao_Paulo
+      - PORT=3001
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./users.csv:/app/users.csv
+      - ./logs:/app/logs
+      - ./resume.json:/app/resume.json
+    ports:
+      - "3003:3001"
+    command: node src/dashboardServer.js
+    restart: unless-stopped
+    profiles: ["dashboard"]

@@ -132,40 +132,53 @@ class EmailMigrator {
   async _uploadLargeAttachment(tgtEmail, messageId, attachment) {
     const token = await this.tgt.auth.getToken();
 
-    // Create upload session
-    const sessionResp = await axios.post(
-      `${GRAPH_BASE}/users/${tgtEmail}/messages/${messageId}/attachments/createUploadSession`,
-      {
-        AttachmentItem: {
-          attachmentType: 'file',
-          name:     attachment.name,
-          size:     attachment.size,
-          isInline: attachment.isInline || false
+    // Decode first to get ACTUAL byte size (metadata size can differ from base64-decoded size)
+    const fileBytes  = Buffer.from(attachment.contentBytes, 'base64');
+    const actualSize = fileBytes.length;
+
+    // Create upload session — retry up to 3x (Exchange may need a moment after message creation)
+    let sessionResp;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      sessionResp = await axios.post(
+        `${GRAPH_BASE}/users/${tgtEmail}/messages/${messageId}/attachments/createUploadSession`,
+        {
+          AttachmentItem: {
+            attachmentType: 'file',
+            name:     attachment.name,
+            size:     actualSize,       // use ACTUAL decoded size, not metadata
+            isInline: attachment.isInline || false
+          }
+        },
+        {
+          headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+          validateStatus: null
         }
-      },
-      {
-        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-        validateStatus: null
+      );
+      if (sessionResp.status === 201) break;
+      if (sessionResp.status === 429) {
+        const wait = parseInt(sessionResp.headers?.['retry-after'] || '10') * 1000;
+        await new Promise(r => setTimeout(r, wait));
+      } else if (attempt < 2) {
+        await new Promise(r => setTimeout(r, 3000));
       }
-    );
+    }
 
     if (sessionResp.status !== 201) {
       throw new Error(`Upload session failed: HTTP ${sessionResp.status}`);
     }
 
     const uploadUrl  = sessionResp.data.uploadUrl;
-    const fileBytes  = Buffer.from(attachment.contentBytes, 'base64');
     const chunkSize  = 4 * 1024 * 1024; // 4MB chunks
     let offset = 0;
 
-    while (offset < fileBytes.length) {
-      const end        = Math.min(offset + chunkSize, fileBytes.length);
+    while (offset < actualSize) {
+      const end        = Math.min(offset + chunkSize, actualSize);
       const chunkBytes = fileBytes.slice(offset, end);
 
       const resp = await axios.put(uploadUrl, chunkBytes, {
         headers: {
           'Content-Type':   'application/octet-stream',
-          'Content-Range':  `bytes ${offset}-${end - 1}/${fileBytes.length}`,
+          'Content-Range':  `bytes ${offset}-${end - 1}/${actualSize}`,
           'Content-Length': chunkBytes.length
         },
         validateStatus: null,
