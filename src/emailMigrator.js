@@ -101,9 +101,15 @@ class EmailMigrator {
     }
   }
 
+  // ── Check if body has CID references (inline images) ─────────────────────
+  _hasCidRefs(msg) {
+    return (msg.body?.content || '').includes('cid:');
+  }
+
   // ── Enrich messages with attachments (concurrency 3) ─────────────────────
   async _enrichWithAttachments(messages, userEmail) {
-    const needsAttachments = messages.filter(m => m.hasAttachments);
+    // hasAttachments=false for inline-only images! Also check body for cid: refs
+    const needsAttachments = messages.filter(m => m.hasAttachments || this._hasCidRefs(m));
     if (needsAttachments.length === 0) return messages;
 
     const limit = pLimit ? pLimit(ATT_CONCURRENCY) : null;
@@ -430,10 +436,10 @@ class EmailMigrator {
       }
 
       if (toMigrate.length > 0) {
-        // Fetch attachments for messages that have them (concurrency 3)
-        const withAtts = toMigrate.filter(m => m.hasAttachments);
+        // Fetch attachments for messages that have them OR have inline CID refs (concurrency 3)
+        const withAtts = toMigrate.filter(m => m.hasAttachments || this._hasCidRefs(m));
         if (withAtts.length > 0) {
-          this.logger.info(`   📎 Fetching attachments for ${withAtts.length} messages...`);
+          this.logger.info(`   📎 Fetching attachments for ${withAtts.length} messages (${withAtts.filter(m => !m.hasAttachments).length} inline-only)...`);
           await this._enrichWithAttachments(toMigrate, srcEmail);
         }
 

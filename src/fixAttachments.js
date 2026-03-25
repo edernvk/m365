@@ -478,7 +478,7 @@ async function fixFolder(srcClient, tgtClient, srcAuth, tgtAuth,
   logger.info(`\n   📁 ${folderName}: scanning...`);
 
   // ── PHASE 1: Get source messages with attachments ──────────────────────────
-  logger.info(`   📥 Phase 1/4: Loading source messages with hasAttachments=true...`);
+  logger.info(`   📥 Phase 1/4: Loading source messages with attachments or inline images...`);
 
   const srcMessages = await fetchAllMessages(
     srcClient, srcEmail, srcFolderId,
@@ -486,14 +486,17 @@ async function fixFolder(srcClient, tgtClient, srcAuth, tgtAuth,
     'from,toRecipients,ccRecipients,bccRecipients,replyTo,flag,importance,isRead,categories,internetMessageHeaders'
   );
 
-  const srcWithAttachments = srcMessages.filter(m => m.hasAttachments);
+  // hasAttachments=false for inline-only images! Also check body for cid: references
+  const hasCid = m => (m.body?.content || '').includes('cid:');
+  const srcWithAttachments = srcMessages.filter(m => m.hasAttachments || hasCid(m));
 
   if (srcWithAttachments.length === 0) {
     logger.info(`   ✅ No source messages with attachments in this folder`);
     return;
   }
 
-  logger.info(`   ✓ Source: ${srcMessages.length} total, ${srcWithAttachments.length} with attachments`);
+  const inlineOnly = srcWithAttachments.filter(m => !m.hasAttachments && hasCid(m)).length;
+  logger.info(`   ✓ Source: ${srcMessages.length} total, ${srcWithAttachments.length} with attachments (${inlineOnly} inline-only)`);
 
   // ── PHASE 2: Build target lookup, find which are missing attachments ────────
   logger.info(`   🔍 Phase 2/4: Checking target for missing attachments...`);
