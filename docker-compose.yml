@@ -13,6 +13,7 @@ services:
       - ./resume.json:/app/resume.json
     command: node src/migrator.js --workload all
     restart: "no"
+    profiles: ["migrator"]
 
   migrate-email:
     build: .

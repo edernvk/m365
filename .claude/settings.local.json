@@ -25,7 +25,24 @@
       "Bash(curl -s http://localhost:3003/api/logs?n=100)",
       "Bash(docker compose:*)",
       "Bash(node -e \":*)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(npm install:*)",
+      "Bash(rm -rf logs/*.log)",
+      "Bash(rm -f resume.json)",
+      "Bash(rm -rf resume.json)",
+      "Bash(mkdir -p logs)",
+      "Bash(rm -f logs/*.log)",
+      "Bash(curl -s http://localhost:3001/api/status)",
+      "Bash(node src/dashboardServer.js)",
+      "Bash(docker-compose --profile dashboard build --no-cache)",
+      "Bash(docker-compose --profile dashboard up -d)",
+      "Bash(docker stop:*)",
+      "Bash(docker rm:*)",
+      "Bash(winpty docker:*)",
+      "Bash(MSYS_NO_PATHCONV=1 docker exec m365-email-dashboard ps aux)",
+      "Bash(MSYS_NO_PATHCONV=1 docker top m365-email-dashboard)",
+      "Bash(MSYS_NO_PATHCONV=1 docker exec m365-email-dashboard ls -la /app/logs/)",
+      "Bash(MSYS_NO_PATHCONV=1 docker exec m365-email-dashboard cat /app/logs/main.log)"
     ]
   }
 }
