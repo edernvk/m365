@@ -218,13 +218,22 @@ class EmailMigrator {
       importance: msg.importance || 'normal',
       categories: msg.categories?.length ? msg.categories : undefined,
       // internetMessageHeaders: preserve up to 5 x- headers (Graph API limit)
+      // Deduplicate by name (case-insensitive) — Graph rejects duplicate header names
       // Also filter values > 995 chars (Graph API rejects longer values)
-      ...(msg.internetMessageHeaders?.length ? {
-        internetMessageHeaders: msg.internetMessageHeaders
+      ...(msg.internetMessageHeaders?.length ? (() => {
+        const seen = new Set();
+        const headers = msg.internetMessageHeaders
           .filter(h => h.name?.toLowerCase().startsWith('x-'))
           .filter(h => (h.value || '').length <= 995)
-          .slice(0, 5)
-      } : {}),
+          .filter(h => {
+            const key = h.name.toLowerCase();
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          })
+          .slice(0, 5);
+        return headers.length ? { internetMessageHeaders: headers } : {};
+      })() : {}),
       singleValueExtendedProperties: [
         originalDate     && { id: 'SystemTime 0x0E06', value: originalDate },
         msg.sentDateTime && { id: 'SystemTime 0x0039', value: msg.sentDateTime },

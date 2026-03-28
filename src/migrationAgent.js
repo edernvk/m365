@@ -91,6 +91,7 @@ function runStep(step, userEmail) {
     let fixed = 0, failed = 0;
     let matchPercent = null;
     let totalSource = 0, totalTarget = 0, totalMissing = 0;
+    let fatalError = null; // mailbox not found, etc
 
     const handleData = (data) => {
       const text = data.toString();
@@ -112,6 +113,11 @@ function runStep(step, userEmail) {
         const emailMatch = line.match(/Email done:\s*(\d+)\s*migrated/);
         if (emailMatch) {
           fixed = parseInt(emailMatch[1]);
+        }
+
+        // Fatal error: mailbox not found
+        if (line.includes('inactive, soft-deleted') || line.includes('MailboxNotFound') || line.includes('MailboxNotEnabledForRESTAPI')) {
+          fatalError = 'Mailbox not found or inactive in target';
         }
 
         // TOTAL: X source / Y target — Z missing (NN.N% match)
@@ -138,6 +144,7 @@ function runStep(step, userEmail) {
         totalSource,
         totalTarget,
         totalMissing,
+        fatalError,
         output
       });
     });
@@ -167,6 +174,12 @@ async function processUser(user) {
       log(`🤖 Agent: Step ${si + 1}/${STEPS.length} — ${step.label}`);
 
       const result = await runStep(step, email);
+
+      // Fatal error: mailbox not found — skip immediately, no retries
+      if (result.fatalError) {
+        log(`🤖 Agent: ⛔ FATAL: ${result.fatalError} — skipping user (no retry)`);
+        return { success: false, matchPercent: 0, totalFixed: 0, totalFailed: 1, attempts: attempt, fatalError: result.fatalError };
+      }
 
       if (!result.ok && step.name === 'migrate') {
         log(`🤖 Agent: ❌ Migration FAILED (exit ${result.exitCode}) — aborting this user`);
