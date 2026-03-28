@@ -456,6 +456,41 @@ app.get('/api/users/:email/log', (req, res) => {
   res.json({ lines });
 });
 
+// ── Reset: clear logs + checkpoint ──────────────────────────────────────────
+app.post('/api/reset', (req, res) => {
+  if (activeJob) return res.status(409).json({ error: 'Cannot reset while a job is running' });
+
+  const logsDir = path.resolve(__dirname, '..', 'logs');
+  const resumePath = path.resolve(__dirname, '..', 'resume.json');
+  let logsDeleted = 0;
+  let resumeDeleted = false;
+
+  // Clear log files
+  try {
+    if (fs.existsSync(logsDir)) {
+      const files = fs.readdirSync(logsDir).filter(f => f.endsWith('.log'));
+      for (const f of files) {
+        fs.unlinkSync(path.join(logsDir, f));
+        logsDeleted++;
+      }
+    }
+  } catch (e) { /* ignore */ }
+
+  // Clear checkpoint
+  try {
+    if (fs.existsSync(resumePath)) {
+      fs.unlinkSync(resumePath);
+      resumeDeleted = true;
+    }
+  } catch (e) { /* ignore */ }
+
+  // Clear in-memory state
+  logBuffer = [];
+  jobHistory = [];
+
+  res.json({ ok: true, logsDeleted, resumeDeleted });
+});
+
 // ── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n  M365 Email Dashboard running on http://localhost:${PORT}\n`);

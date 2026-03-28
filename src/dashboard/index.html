@@ -310,6 +310,21 @@
         await fetch('/api/jobs/cancel', { method: 'POST' });
       };
 
+      const resetAll = async () => {
+        if (!confirm('Limpar TODOS os logs e checkpoint (resume.json)?\n\nIsso permite re-executar tudo do zero.\nEmails ja migrados NAO serao duplicados (dedup protege).')) return;
+        const r = await fetch('/api/reset', { method: 'POST' });
+        if (r.ok) {
+          const d = await r.json();
+          setLogs([]);
+          setUserResults({});
+          setStepResults({});
+          alert(`Limpeza concluida!\n${d.logsDeleted} logs apagados\nCheckpoint: ${d.resumeDeleted ? 'removido' : 'nao existia'}`);
+        } else {
+          const d = await r.json();
+          alert(d.error || 'Erro ao limpar');
+        }
+      };
+
       const addUser = async () => {
         if (!newSource || !newTarget) return;
         const r = await fetch('/api/users', {
@@ -441,6 +456,9 @@
                     <span>3. Fila de Execucao</span>
                     <div style={{display:'flex',gap:8}}>
                       {queue.length > 0 && <button className="btn sm outline" onClick={clearQueue}>Limpar</button>}
+                      <button className="btn sm danger" onClick={resetAll} disabled={!!job} title="Limpar logs e checkpoint">
+                        🗑 Resetar
+                      </button>
                       <button className="btn sm primary" onClick={startJob} disabled={!queue.length || !!job}>
                         ▶ Iniciar {TASKS[task]?.label}
                       </button>
