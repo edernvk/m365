@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker ps:*)",
+      "Bash(dir /b docker*.yml)",
+      "Bash(dir /b Dockerfile*)",
+      "Bash(docker-compose build:*)",
+      "Bash(grep -r \"dashboard\\\\|report\\\\|export.*json\\\\|summary\" /c/git-2/m365/src --include=*.js)",
+      "Bash(grep -r \"summary\\\\|summary.json\" /c/git-2/m365 --include=*.js)",
+      "Bash(echo $HOME)",
+      "Read(//c/Users/eder-26/**)",
+      "Bash(docker exec:*)",
+      "Bash(ls -la \"/c/git-26/sharepoint-migrator\\(git\\)\")",
+      "Bash(ls -la \"/c/git-26/sharepoint-migrator\\(git\\)/prod\")",
+      "Bash(docker image:*)",
+      "Bash(ls -la \"/c/git-26/sharepoint-migrator\\(git\\)/prod/src\")",
+      "Bash(ls -la \"/c/git-26/sharepoint-migrator\\(git\\)/prod/src/dashboard\")",
+      "Bash(find \"/c/git-26/sharepoint-migrator\\(git\\)/prod\" -type f -name \"*.js\" -o -name \"*.json\")",
+      "Bash(wc -l \"/c/git-26/sharepoint-migrator\\(git\\)/prod/src/dashboard/index.html\" \"/c/git-26/sharepoint-migrator\\(git\\)/prod/src/dashboardServer.js\" \"/c/git-26/sharepoint-migrator\\(git\\)/prod/src/sharepointMigrator.js\")",
+      "Bash(docker-compose --profile dashboard up -d dashboard)",
+      "Bash(docker-compose --profile dashboard down)",
+      "Bash(curl -s http://localhost:3003/api/logs?n=50)",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s http://localhost:3003/api/status)",
+      "Bash(curl -s http://localhost:3003/api/logs?n=100)",
+      "Bash(docker compose:*)",
+      "Bash(node -e \":*)",
+      "WebSearch"
+    ]
+  }
+}

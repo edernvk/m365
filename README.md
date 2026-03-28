@@ -92,6 +92,10 @@ maria@antiga.com.br,maria@nova.com.br,Maria Souza
 # Build
 docker-compose build
 
+# Rodar com dashboard
+
+docker-compose --profile dashboard up -d
+
 # Rodar migração completa (todos os workloads)
 docker-compose up migrator
 
