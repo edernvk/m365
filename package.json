@@ -13,6 +13,9 @@
     "fix:drafts": "node src/fixDrafts.js",
     "fix:drafts:dry": "node src/fixDrafts.js --dry-run",
     "fix:attachments": "node src/fixAttachments.js",
+    "dedup": "node src/dedupEmails.js",
+    "dedup:dry": "node src/dedupEmails.js --dry-run",
+    "verify": "node src/verifyMigration.js",
     "dashboard": "node src/dashboardServer.js"
   },
   "dependencies": {

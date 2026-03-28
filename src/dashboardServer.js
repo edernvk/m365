@@ -109,10 +109,14 @@ function parseLine(raw) {
 
 // ── Script mapping ───────────────────────────────────────────────────────────
 const SCRIPTS = {
-  'migrate':         { script: 'migrator.js',       baseArgs: ['--workload', 'email'] },
-  'fix-drafts':      { script: 'fixDrafts.js',      baseArgs: [] },
-  'fix-attachments': { script: 'fixAttachments.js',  baseArgs: [] },
+  'migrate':         { script: 'migrator.js',         baseArgs: ['--workload', 'email'] },
+  'fix-drafts':      { script: 'fixDrafts.js',        baseArgs: [] },
+  'fix-attachments': { script: 'fixAttachments.js',    baseArgs: [] },
+  'dedup':           { script: 'dedupEmails.js',       baseArgs: [] },
+  'verify':          { script: 'verifyMigration.js',   baseArgs: [] },
 };
+
+const PIPELINE_STEPS = ['migrate', 'fix-drafts', 'fix-attachments', 'dedup', 'verify'];
 
 // ── Run one user for a task ──────────────────────────────────────────────────
 function spawnForUser(task, userEmail) {
@@ -162,56 +166,115 @@ function spawnForUser(task, userEmail) {
   });
 }
 
-// ── Process job queue: run users one by one ──────────────────────────────────
+// ── Process job queue: supports single task or full pipeline ─────────────────
 async function processJob(job) {
   activeJob = job;
   cancelled = false;
   logBuffer = [];
 
-  broadcast('job', { type: 'job_start', jobId: job.id, task: job.task, users: job.users.map(u => u.sourceEmail) });
+  const steps = job.pipeline || [job.task];
+  const failedUsers = new Set(); // users that failed migration — skip subsequent steps
 
-  for (let i = 0; i < job.users.length; i++) {
-    if (cancelled) {
-      // Mark remaining as cancelled
-      for (let j = i; j < job.users.length; j++) {
-        const email = job.users[j].sourceEmail;
-        job.userResults[email] = { status: 'cancelled' };
-      }
-      break;
-    }
+  broadcast('job', {
+    type: 'job_start', jobId: job.id, task: job.task,
+    pipeline: job.pipeline || null,
+    users: job.users.map(u => u.sourceEmail)
+  });
 
-    const user = job.users[i];
-    const email = user.sourceEmail;
-    job.currentUserIdx = i;
-    job.currentUser = email;
-    job.userResults[email] = { status: 'running', folder: '', fixed: 0, failed: 0 };
+  for (let s = 0; s < steps.length; s++) {
+    if (cancelled) break;
+
+    const stepName = steps[s];
+    job.currentStep = s;
+    job.currentStepName = stepName;
+    if (!job.stepResults) job.stepResults = {};
+    job.stepResults[stepName] = {};
 
     broadcast('job', {
-      type: 'user_running', jobId: job.id, email,
-      userIdx: i, userTotal: job.users.length
+      type: 'step_start', jobId: job.id,
+      step: s, stepTotal: steps.length, stepName
     });
 
-    const result = await spawnForUser(job.task, email);
+    // Reset per-user status for this step
+    for (const user of job.users) {
+      job.userResults[user.sourceEmail] = { status: 'queued' };
+    }
 
-    const status = cancelled ? 'cancelled' : result.ok ? 'done' : 'error';
-    job.userResults[email] = {
-      status,
-      fixed: result.fixed || 0,
-      failed: result.failed || 0,
-      exitCode: result.exitCode
-    };
+    for (let i = 0; i < job.users.length; i++) {
+      if (cancelled) {
+        for (let j = i; j < job.users.length; j++) {
+          const email = job.users[j].sourceEmail;
+          job.userResults[email] = { status: 'cancelled' };
+          job.stepResults[stepName][email] = { status: 'cancelled' };
+        }
+        break;
+      }
+
+      const user = job.users[i];
+      const email = user.sourceEmail;
+
+      // Skip users that failed migration in pipeline mode
+      if (job.pipeline && failedUsers.has(email)) {
+        job.userResults[email] = { status: 'skipped', fixed: 0, failed: 0 };
+        job.stepResults[stepName][email] = { status: 'skipped' };
+        broadcast('job', {
+          type: 'user_finished', jobId: job.id, email, status: 'skipped',
+          fixed: 0, failed: 0,
+          userIdx: i, userTotal: job.users.length,
+          step: s, stepName
+        });
+        continue;
+      }
+
+      job.currentUserIdx = i;
+      job.currentUser = email;
+      job.userResults[email] = { status: 'running', folder: '', fixed: 0, failed: 0 };
+
+      broadcast('job', {
+        type: 'user_running', jobId: job.id, email,
+        userIdx: i, userTotal: job.users.length,
+        step: s, stepName
+      });
+
+      const result = await spawnForUser(stepName, email);
+
+      const status = cancelled ? 'cancelled' : result.ok ? 'done' : 'error';
+      job.userResults[email] = {
+        status,
+        fixed: result.fixed || 0,
+        failed: result.failed || 0,
+        exitCode: result.exitCode
+      };
+      job.stepResults[stepName][email] = { ...job.userResults[email] };
+
+      // If migration step fails, skip this user in subsequent steps
+      if (stepName === 'migrate' && status === 'error') {
+        failedUsers.add(email);
+      }
+
+      broadcast('job', {
+        type: 'user_finished', jobId: job.id, email, status,
+        fixed: result.fixed, failed: result.failed,
+        userIdx: i, userTotal: job.users.length,
+        step: s, stepName
+      });
+    }
 
     broadcast('job', {
-      type: 'user_finished', jobId: job.id, email, status,
-      fixed: result.fixed, failed: result.failed,
-      userIdx: i, userTotal: job.users.length
+      type: 'step_finished', jobId: job.id,
+      step: s, stepName, results: job.stepResults[stepName]
     });
   }
 
   job.status = cancelled ? 'cancelled' : 'done';
   job.finishedAt = new Date().toISOString();
 
-  broadcast('job', { type: 'job_finished', jobId: job.id, task: job.task, status: job.status, results: job.userResults });
+  broadcast('job', {
+    type: 'job_finished', jobId: job.id, task: job.task,
+    pipeline: job.pipeline || null,
+    status: job.status, results: job.userResults,
+    stepResults: job.stepResults
+  });
 
   // Archive
   jobHistory.unshift({ ...job });
@@ -237,10 +300,14 @@ app.get('/api/events', (req, res) => {
   // Send current state
   const state = { activeJob: activeJob ? {
     id: activeJob.id, task: activeJob.task,
+    pipeline: activeJob.pipeline || null,
+    currentStep: activeJob.currentStep || 0,
+    currentStepName: activeJob.currentStepName || activeJob.task,
     users: activeJob.users.map(u => u.sourceEmail),
     currentUser: activeJob.currentUser,
     currentUserIdx: activeJob.currentUserIdx,
-    userResults: activeJob.userResults
+    userResults: activeJob.userResults,
+    stepResults: activeJob.stepResults || {}
   } : null };
   res.write(`event: connected\ndata: ${JSON.stringify(state)}\n\n`);
 
@@ -260,10 +327,14 @@ app.get('/api/status', (req, res) => {
     running: !!activeJob,
     job: activeJob ? {
       id: activeJob.id, task: activeJob.task,
+      pipeline: activeJob.pipeline || null,
+      currentStep: activeJob.currentStep || 0,
+      currentStepName: activeJob.currentStepName || activeJob.task,
       users: activeJob.users.map(u => u.sourceEmail),
       currentUser: activeJob.currentUser,
       currentUserIdx: activeJob.currentUserIdx,
       userResults: activeJob.userResults,
+      stepResults: activeJob.stepResults || {},
       startedAt: activeJob.startedAt
     } : null,
     history: jobHistory.slice(0, 5)
@@ -280,12 +351,12 @@ app.get('/api/users', (req, res) => {
   }
 });
 
-// Start a job: { task: 'migrate'|'fix-drafts'|'fix-attachments', users: ['email1','email2'] }
+// Start a job: { task: 'migrate'|'fix-drafts'|'fix-attachments'|'dedup'|'verify'|'full-pipeline', users: [...] }
 app.post('/api/jobs', (req, res) => {
   if (activeJob) return res.status(409).json({ error: `Job already running: ${activeJob.task}` });
 
   const { task, users: selectedEmails } = req.body;
-  if (!SCRIPTS[task]) return res.status(400).json({ error: 'Invalid task' });
+  if (task !== 'full-pipeline' && !SCRIPTS[task]) return res.status(400).json({ error: 'Invalid task' });
   if (!selectedEmails || !selectedEmails.length) return res.status(400).json({ error: 'No users selected' });
 
   const allUsers = readUsersCSV();
@@ -295,11 +366,15 @@ app.post('/api/jobs', (req, res) => {
   const job = {
     id: Date.now().toString(36),
     task,
+    pipeline: task === 'full-pipeline' ? PIPELINE_STEPS : null,
     users: jobUsers,
     status: 'running',
     currentUser: null,
     currentUserIdx: 0,
+    currentStep: 0,
+    currentStepName: task === 'full-pipeline' ? PIPELINE_STEPS[0] : task,
     userResults: {},
+    stepResults: {},
     startedAt: new Date().toISOString(),
     finishedAt: null
   };
@@ -307,7 +382,7 @@ app.post('/api/jobs', (req, res) => {
   // Start async processing
   processJob(job);
 
-  res.json({ started: true, jobId: job.id, task, users: jobUsers.map(u => u.sourceEmail) });
+  res.json({ started: true, jobId: job.id, task, pipeline: job.pipeline, users: jobUsers.map(u => u.sourceEmail) });
 });
 
 // Cancel active job

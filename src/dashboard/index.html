@@ -95,6 +95,19 @@
     .task-card .label { font-size: 13px; font-weight: 600; }
     .task-card .desc { font-size: 11px; color: #8b949e; margin-top: 4px; }
     .task-card:hover .label { color: #58a6ff; }
+
+    .task-picker-wrap { padding: 16px; }
+    .task-picker-main { display: flex; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+    .task-card.pipeline { flex: 1 1 100%; border-color: #238636; background: rgba(35,134,54,.06); }
+    .task-card.pipeline.active { border-color: #3fb950; background: rgba(63,185,80,.1); }
+    .task-card.pipeline .label { color: #3fb950; }
+
+    .stepper { display: flex; align-items: center; gap: 0; padding: 12px 16px; background: #1c2129; border-bottom: 1px solid #21262d; overflow-x: auto; }
+    .step { display: flex; align-items: center; gap: 6px; padding: 6px 14px; font-size: 12px; font-weight: 600; border-radius: 16px; white-space: nowrap; }
+    .step.pending { color: #484f58; }
+    .step.active { color: #58a6ff; background: rgba(88,166,255,.1); }
+    .step.done { color: #3fb950; background: rgba(63,185,80,.08); }
+    .step-arrow { color: #30363d; font-size: 16px; margin: 0 2px; }
   </style>
 </head>
 <body>
@@ -107,7 +120,13 @@
       'migrate':         { icon: '📧', label: 'Migrar Emails',      desc: 'Migra caixa de entrada completa' },
       'fix-drafts':      { icon: '📝', label: 'Corrigir Rascunhos', desc: 'Remove flag de rascunho' },
       'fix-attachments': { icon: '📎', label: 'Corrigir Anexos',    desc: 'Reanexa arquivos faltantes' },
+      'dedup':           { icon: '🔄', label: 'Remover Duplicados', desc: 'Remove emails duplicados no destino' },
+      'verify':          { icon: '✅', label: 'Verificar',          desc: 'Compara origem vs destino' },
+      'full-pipeline':   { icon: '🚀', label: 'Pipeline Completo',  desc: 'Migrar → Rascunhos → Anexos → Dedup → Verificar' },
     };
+
+    const PIPELINE_STEPS = ['migrate', 'fix-drafts', 'fix-attachments', 'dedup', 'verify'];
+    const STEP_LABELS = { 'migrate': 'Migrar', 'fix-drafts': 'Rascunhos', 'fix-attachments': 'Anexos', 'dedup': 'Dedup', 'verify': 'Verificar' };
 
     function App() {
       // Data
@@ -126,6 +145,12 @@
       const [logs, setLogs]           = useState([]);
 
       // User management
+      // Pipeline state
+      const [pipelineSteps, setPipelineSteps] = useState(null);
+      const [currentStep, setCurrentStep]     = useState(0);
+      const [currentStepName, setCurrentStepName] = useState('');
+      const [stepResults, setStepResults]     = useState({});
+
       const [newSource, setNewSource] = useState('');
       const [newTarget, setNewTarget] = useState('');
       const [newName, setNewName]     = useState('');
@@ -155,6 +180,10 @@
             setQueue(data.activeJob.users);
             setUserResults(data.activeJob.userResults || {});
             setCurrentUser(data.activeJob.currentUser);
+            setPipelineSteps(data.activeJob.pipeline || null);
+            setCurrentStep(data.activeJob.currentStep || 0);
+            setCurrentStepName(data.activeJob.currentStepName || data.activeJob.task);
+            setStepResults(data.activeJob.stepResults || {});
             setTab('running');
           }
         });
@@ -192,8 +221,21 @@
           switch (ev.type) {
             case 'job_start':
               setJob(ev);
+              setPipelineSteps(ev.pipeline || null);
+              setCurrentStep(0);
+              setCurrentStepName(ev.pipeline ? ev.pipeline[0] : ev.task);
+              setStepResults({});
               setTab('running');
               setLogs([]);
+              break;
+            case 'step_start':
+              setCurrentStep(ev.step);
+              setCurrentStepName(ev.stepName);
+              // Reset user results for new step
+              setUserResults({});
+              break;
+            case 'step_finished':
+              setStepResults(prev => ({ ...prev, [ev.stepName]: ev.results }));
               break;
             case 'user_running':
               setUserResults(prev => ({ ...prev, [ev.email]: { status: 'running', fixed: 0, failed: 0 } }));
@@ -209,6 +251,8 @@
             case 'job_finished':
               setJob(null);
               setCurrentUser(null);
+              setPipelineSteps(ev.pipeline || null);
+              setStepResults(ev.stepResults || {});
               break;
           }
         });
@@ -309,7 +353,8 @@
             <div className={`status-dot ${job ? 'running' : ''}`} />
             <h1><span>M365</span> Email Migrator</h1>
             {job && <span style={{fontSize:13,color:'#8b949e',marginLeft:'auto'}}>
-              {TASKS[job.task]?.icon} {TASKS[job.task]?.label} — {currentUser || '...'}
+              {TASKS[currentStepName]?.icon || TASKS[job.task]?.icon} {TASKS[currentStepName]?.label || TASKS[job.task]?.label}
+              {pipelineSteps ? ` (${currentStep+1}/${pipelineSteps.length})` : ''} — {currentUser || '...'}
               {currentFolder ? ` / ${currentFolder}` : ''}
             </span>}
           </div>
@@ -338,14 +383,21 @@
                 <div className="panel-header">
                   <span>1. Escolha a Tarefa</span>
                 </div>
-                <div className="task-picker">
-                  {Object.entries(TASKS).map(([key, t]) => (
-                    <div key={key} className={`task-card ${task===key?'active':''}`} onClick={()=>setTask(key)}>
-                      <div className="icon">{t.icon}</div>
-                      <div className="label">{t.label}</div>
-                      <div className="desc">{t.desc}</div>
-                    </div>
-                  ))}
+                <div className="task-picker-wrap">
+                  <div className="task-picker-main">
+                    {Object.entries(TASKS).filter(([k]) => k !== 'full-pipeline').map(([key, t]) => (
+                      <div key={key} className={`task-card ${task===key?'active':''}`} onClick={()=>setTask(key)}>
+                        <div className="icon">{t.icon}</div>
+                        <div className="label">{t.label}</div>
+                        <div className="desc">{t.desc}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className={`task-card pipeline ${task==='full-pipeline'?'active':''}`} onClick={()=>setTask('full-pipeline')}>
+                    <div className="icon">{TASKS['full-pipeline'].icon}</div>
+                    <div className="label">{TASKS['full-pipeline'].label}</div>
+                    <div className="desc">{TASKS['full-pipeline'].desc}</div>
+                  </div>
                 </div>
               </div>
 
@@ -390,7 +442,7 @@
                     <div style={{display:'flex',gap:8}}>
                       {queue.length > 0 && <button className="btn sm outline" onClick={clearQueue}>Limpar</button>}
                       <button className="btn sm primary" onClick={startJob} disabled={!queue.length || !!job}>
-                        ▶ Iniciar {TASKS[task].label}
+                        ▶ Iniciar {TASKS[task]?.label}
                       </button>
                     </div>
                   </div>
@@ -423,12 +475,33 @@
           {/* ── TAB: Running ────────────────────────────────────────── */}
           {tab === 'running' && (
             <div>
+              {/* Pipeline stepper */}
+              {pipelineSteps && (
+                <div className="panel" style={{marginBottom:16}}>
+                  <div className="stepper">
+                    {pipelineSteps.map((step, i) => {
+                      const isDone = stepResults[step] || (!job && i <= currentStep);
+                      const isActive = job && i === currentStep;
+                      const cls = isDone && !isActive ? 'done' : isActive ? 'active' : 'pending';
+                      return (
+                        <React.Fragment key={step}>
+                          {i > 0 && <span className="step-arrow">›</span>}
+                          <span className={`step ${cls}`}>
+                            {isDone && !isActive ? '✓' : `${i+1}.`} {STEP_LABELS[step] || step}
+                          </span>
+                        </React.Fragment>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
               {/* Global progress */}
               {(job || Object.keys(userResults).length > 0) && (
                 <div style={{marginBottom:20}}>
                   <div style={{display:'flex',justifyContent:'space-between',fontSize:12,color:'#8b949e',marginBottom:4}}>
-                    <span>{job ? `${TASKS[job.task]?.icon} ${TASKS[job.task]?.label}` : 'Job finalizado'}</span>
-                    <span>{doneCount}/{queueTotal} usuarios</span>
+                    <span>{job ? `${TASKS[currentStepName]?.icon || TASKS[job.task]?.icon} ${TASKS[currentStepName]?.label || TASKS[job.task]?.label}` : 'Job finalizado'}</span>
+                    <span>{doneCount}/{queueTotal} usuarios{pipelineSteps ? ` (etapa ${currentStep+1}/${pipelineSteps.length})` : ''}</span>
                   </div>
                   <div className="progress-bar" style={{height:8}}>
                     <div className="progress-fill" style={{width:`${queueTotal?Math.round(doneCount/queueTotal*100):0}%`}} />
@@ -463,12 +536,13 @@
                             <div style={{fontSize:11,color:'#8b949e'}}>{email}</div>
                           </td>
                           <td>
-                            <span className={`badge ${r.status}`}>
+                            <span className={`badge ${r.status === 'skipped' ? 'cancelled' : r.status}`}>
                               {r.status === 'queued' && 'Na fila'}
                               {r.status === 'running' && 'Rodando'}
                               {r.status === 'done' && 'Concluido'}
                               {r.status === 'error' && 'Erro'}
                               {r.status === 'cancelled' && 'Cancelado'}
+                              {r.status === 'skipped' && 'Pulado'}
                             </span>
                           </td>
                           <td style={{textAlign:'right',fontSize:12}}>
