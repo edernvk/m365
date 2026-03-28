@@ -114,6 +114,7 @@ const SCRIPTS = {
   'fix-attachments': { script: 'fixAttachments.js',    baseArgs: [] },
   'dedup':           { script: 'dedupEmails.js',       baseArgs: [] },
   'verify':          { script: 'verifyMigration.js',   baseArgs: [] },
+  'agent':           { script: 'migrationAgent.js',    baseArgs: [] },
 };
 
 const PIPELINE_STEPS = ['migrate', 'fix-drafts', 'fix-attachments', 'dedup', 'verify'];

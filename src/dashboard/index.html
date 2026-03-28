@@ -102,6 +102,10 @@
     .task-card.pipeline.active { border-color: #3fb950; background: rgba(63,185,80,.1); }
     .task-card.pipeline .label { color: #3fb950; }
 
+    .task-card.agent { flex: 1 1 100%; border-color: #d29922; background: rgba(210,153,34,.06); }
+    .task-card.agent.active { border-color: #e3b341; background: rgba(227,179,65,.12); }
+    .task-card.agent .label { color: #e3b341; }
+
     .stepper { display: flex; align-items: center; gap: 0; padding: 12px 16px; background: #1c2129; border-bottom: 1px solid #21262d; overflow-x: auto; }
     .step { display: flex; align-items: center; gap: 6px; padding: 6px 14px; font-size: 12px; font-weight: 600; border-radius: 16px; white-space: nowrap; }
     .step.pending { color: #484f58; }
@@ -123,6 +127,7 @@
       'dedup':           { icon: '🔄', label: 'Remover Duplicados', desc: 'Remove emails duplicados no destino' },
       'verify':          { icon: '✅', label: 'Verificar',          desc: 'Compara origem vs destino' },
       'full-pipeline':   { icon: '🚀', label: 'Pipeline Completo',  desc: 'Migrar → Rascunhos → Anexos → Dedup → Verificar' },
+      'agent':           { icon: '🤖', label: 'Agente Autonomo',   desc: 'Migra, corrige, verifica — loop automatico ate 100% match' },
     };
 
     const PIPELINE_STEPS = ['migrate', 'fix-drafts', 'fix-attachments', 'dedup', 'verify'];
@@ -407,6 +412,11 @@
                         <div className="desc">{t.desc}</div>
                       </div>
                     ))}
+                  </div>
+                  <div className={`task-card agent ${task==='agent'?'active':''}`} onClick={()=>setTask('agent')}>
+                    <div className="icon">{TASKS['agent'].icon}</div>
+                    <div className="label">{TASKS['agent'].label}</div>
+                    <div className="desc">{TASKS['agent'].desc}</div>
                   </div>
                   <div className={`task-card pipeline ${task==='full-pipeline'?'active':''}`} onClick={()=>setTask('full-pipeline')}>
                     <div className="icon">{TASKS['full-pipeline'].icon}</div>

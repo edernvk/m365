@@ -16,6 +16,7 @@
     "dedup": "node src/dedupEmails.js",
     "dedup:dry": "node src/dedupEmails.js --dry-run",
     "verify": "node src/verifyMigration.js",
+    "agent": "node src/migrationAgent.js",
     "dashboard": "node src/dashboardServer.js"
   },
   "dependencies": {
