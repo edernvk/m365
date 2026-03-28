@@ -787,7 +787,7 @@ async function processUser(srcClient, tgtClient, srcAuth, tgtAuth, user, logger)
     if (processed > 0 && fi < srcFolders.length - 1) await sleep(FOLDER_DELAY_MS);
   }
 
-  logger.info(`\n   ✅ Done: ${stats.fixed} fixed, ${stats.failed} failed`);
+  logger.info(`\nUser done: ${stats.fixed} fixed, ${stats.failed} failed`);
   return stats;
 }
 
